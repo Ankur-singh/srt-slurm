@@ -12,6 +12,7 @@ Backend configs are defined in srtctl.backends.configs/ for modularity.
 """
 
 import builtins
+import dataclasses
 import hashlib
 import itertools
 import logging
@@ -30,7 +31,7 @@ from typing import (
 )
 
 import yaml
-from marshmallow import Schema, ValidationError, fields
+from marshmallow import Schema, ValidationError, fields, validate
 from marshmallow_dataclass import dataclass
 
 from srtctl.backends import (
@@ -47,8 +48,20 @@ from srtctl.core.formatting import (
 
 # Leaf module (stdlib-only imports), so this cannot cycle back into schema.
 from srtctl.core.power.contract import CONTAINER_LOG_DIR
+from srtctl.core.source import DynamoSourceConfig, is_commit_sha
+from srtctl.services.config import ServiceConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _dataclass_default(item: dataclasses.Field) -> Any:
+    """The default a dataclass field would take when unset (None when it has none)."""
+    if item.default is not dataclasses.MISSING:
+        return item.default
+    if item.default_factory is not dataclasses.MISSING:
+        return item.default_factory()
+    return None
+
 
 # Local copies of srtctl.core.power.contract values so that loading a config
 # never imports the power package; equality is pinned by tests.
@@ -197,6 +210,40 @@ class S3Config:
 
 
 @dataclass(frozen=True)
+class PostEvalConfig:
+    """How the post-benchmark (or eval-only) accuracy evaluation is dispatched.
+
+    The evaluation runs when the job environment sets ``RUN_EVAL=true`` (after
+    the benchmark) or ``EVAL_ONLY=true`` (instead of it). srtctl forwards a
+    built-in list of workflow variables into the eval process; downstream runners
+    used to patch that list in srtctl's source. This block makes it config.
+
+    Attributes:
+        passthrough_env: Extra environment variable names forwarded from the
+            orchestrator's environment into the eval process when set (on top
+            of the built-in list: RUN_EVAL, EVAL_ONLY, MODEL, ISL, OSL, ...).
+        command: Argv that replaces the built-in lm-eval runner command. May use
+            the placeholders ``{endpoint}`` (the frontend URL) and
+            ``{infmax_workspace}`` (the InferenceMAX workspace mount). Not
+            shell-interpreted; wrap in ``bash -lc`` yourself if you need a shell.
+    """
+
+    passthrough_env: list[str] = field(default_factory=list)
+    command: list[str] | None = None
+
+    Schema: ClassVar[type[Schema]] = Schema
+
+    def __post_init__(self) -> None:
+        for name in self.passthrough_env:
+            if not name.isidentifier():
+                raise ValidationError(
+                    f"post_eval.passthrough_env entries must be environment variable names, got {name!r}"
+                )
+        if self.command is not None and not self.command:
+            raise ValidationError("post_eval.command, if set, must be non-empty (omit it to use the lm-eval runner)")
+
+
+@dataclass(frozen=True)
 class HostSetupConfig:
     """Commands run on the bare host of each allocated node, outside the container.
 
@@ -248,6 +295,9 @@ class ClusterConfig:
     default_partition: str | None = None
     default_time_limit: str | None = None
     gpus_per_node: int | None = None
+    # Default for ``ResourceConfig.gpu_type`` when the recipe omits it. Lets one
+    # recipe move between clusters of different GPU types without an edit.
+    default_gpu_type: str | None = None
     network_interface: str | None = None
     use_gpus_per_node_directive: bool = True
     use_segment_sbatch_directive: bool = True
@@ -306,19 +356,6 @@ class Precision(str, Enum):
     FP8 = "fp8"
     FP16 = "fp16"
     BF16 = "bf16"
-
-
-class BenchmarkType(str, Enum):
-    MANUAL = "manual"
-    CUSTOM = "custom"
-    SA_BENCH = "sa-bench"
-    ROUTER = "router"
-    MOONCAKE_ROUTER = "mooncake-router"
-    TRACE_REPLAY = "trace-replay"
-    MMLU = "mmlu"
-    GPQA = "gpqa"
-    GSM8K = "gsm8k"
-    LONGBENCHV2 = "longbenchv2"
 
 
 class ProfilingType(str, Enum):
@@ -549,7 +586,11 @@ class HetComponent:
 class ResourceConfig:
     """Resource allocation configuration."""
 
-    gpu_type: str
+    # GPU type (h100, gb200, ...). Cluster fact, not a topology choice. Optional:
+    # a recipe that omits it inherits `default_gpu_type` from srtslurm.yaml, and
+    # `gpus_per_node` inherits the cluster `gpus_per_node`. Both are still worth
+    # setting in a recipe so it is self-describing for result rollups.
+    gpu_type: str | None = None
     gpus_per_node: int = 4
 
     # Disaggregated mode
@@ -564,7 +605,7 @@ class ResourceConfig:
 
     # If True, place each partial-node worker on its own node instead of
     # packing multiple onto the same node. Caller must reserve enough nodes
-    # (e.g. set decode_nodes=decode_workers when gpus_per_decode<gpus_per_node).
+    # (e.g. give roles.decode as many nodes as workers when its gpus < gpus_per_node).
     spread_workers: bool = False
 
     # SLURM heterogeneous-job opt-in. Tri-state: None defers to the cluster
@@ -748,12 +789,12 @@ class BenchmarkConfig:
     # together with resources.het_jobs: true.
     # Default: False.
     client_dedicated_node: bool = False
-    # Governs how the dedicated-node flags combine when more than one of
-    # client_dedicated_node, frontend.dedicated_node, and
-    # infra.etcd_nats_dedicated_node is set. If True (default), every
-    # requested role shares a single reserved node. If False, each requested
-    # role gets its own reserved node (requires enough total nodes: worker
-    # count + number of dedicated roles).
+    # Governs how dedicated placements combine when more than one of the
+    # benchmark client, the frontend, and the etcd/nats services asks for
+    # placement.node: dedicated. If True (default), every requested role
+    # shares a single reserved node. If False, each requested role gets its
+    # own reserved node (requires enough total nodes: worker count + number
+    # of dedicated roles).
     colocate_with_frontend: bool = True
     sweep: Annotated[SweepConfig, SweepConfigField(allow_none=True, load_default=None, dump_default=None)] | None = None
     # Accuracy benchmark fields
@@ -806,8 +847,6 @@ class BenchmarkConfig:
     aiperf_package: str | None = None
     # Extra aiperf CLI flags passed through to bench.sh (e.g., benchmark-duration: 600, workers-max: 200)
     aiperf_args: dict[str, Any] = field(default_factory=dict)
-    # Post-process: export analysis/srtlog per-node batch CSVs + gen_throughput.csv (see postprocess_stage)
-    export_node_metrics: bool = False
     # SA-Bench: optional SGLang /slow_down on decode workers (sglang frontend only; see benchmark_stage)
     slow_down_sleep_time: float | None = None  # forward_sleep_time (seconds); unset = feature off
     slow_down_wait_time: float | None = None  # seconds until POST clears slow_down; unset = feature off
@@ -1122,7 +1161,7 @@ DEFAULT_NODE_EXPORTER = TelemetryExporterConfig(
 # Per-process and per-thread host telemetry from /proc: CPU seconds by mode,
 # thread count and thread CPU by thread name, context switches, RSS, open fds --
 # for the frontend, the worker handlers, the engine ranks and the client, grouped
-# by command line (see telemetry_stage.process_exporter_config_yaml). This is the
+# by command line (see services.exporters.process_exporter_config_yaml). This is the
 # signal the Prometheus surface cannot carry: Dynamo publishes no process_* or
 # thread metrics, and node_exporter only sees the machine.
 #
@@ -1267,7 +1306,7 @@ class ObservabilityConfig:
     The retired ``scrape_metrics`` / ``scrape_interval_seconds`` /
     ``scrape_output`` knobs (the in-job RAW Prometheus scraper) are rejected
     at load like any unknown key; the ingest still reads historical
-    ``raw_prometheus.jsonl`` artifacts.
+    ``raw_prometheus.jsonl`` artifacts (the ingest no longer reads them either).
     """
 
     enabled: bool = False
@@ -1459,13 +1498,19 @@ _DYNAMO_CACHE_ROOT = "/configs/dynamo-wheels"
 
 
 def dynamo_source_cache_key(dynamo_hash: str, cargo_patches: list[str] | None = None) -> str:
-    """Return the cache key shared by Slurm and direct source builds."""
+    """Return the cache key shared by Slurm and direct source builds.
+
+    A ref that is not a commit (``refs/pull/14000/head`` when ``srtctl apply``
+    could not pin it) is sanitized into a directory name; such a key can go
+    stale as the ref moves, which is why apply pins refs to SHAs up front.
+    """
+    key = dynamo_hash.strip().replace("/", "-")
     if not cargo_patches:
-        return dynamo_hash
+        return key
     # Version the build recipe so a patching change invalidates old artifacts
     # even when the dependency declarations themselves do not change.
     digest = hashlib.sha1(("dep-override-v3\n" + "\n".join(cargo_patches)).encode()).hexdigest()[:8]
-    return f"{dynamo_hash}-patch-{digest}"
+    return f"{key}-patch-{digest}"
 
 
 def dynamo_cargo_patch_commands(cargo_patches: list[str] | None = None) -> tuple[str, ...]:
@@ -1491,8 +1536,17 @@ def _git_clone_cmd() -> str:
     return shlex.join(git_clone_command_prefix())
 
 
-def _hash_cached_source_install(dynamo_hash: str, cargo_patches: list[str] | None = None) -> str:
+def _hash_cached_source_install(
+    dynamo_hash: str,
+    cargo_patches: list[str] | None = None,
+    repo_url: str = DynamoSourceConfig.DEFAULT_GIT,
+) -> str:
     """Bash for hash-pinned source install with a /configs/dynamo-wheels cache.
+
+    ``dynamo_hash`` is normally a commit SHA (``srtctl apply`` pins
+    ``dynamo.source.rev`` before submit). A bare ref such as
+    ``refs/pull/14000/head`` still works: it is fetched by name and checked out
+    as ``FETCH_HEAD``, since a plain clone does not carry PR refs.
 
     Cache layout: ``{root}/<key>/`` contains the maturin wheel
     (``ai_dynamo_runtime-*.whl``), a tarball of the dynamo source tree
@@ -1519,6 +1573,11 @@ def _hash_cached_source_install(dynamo_hash: str, cargo_patches: list[str] | Non
         override_cmd += " && "
     cache = f"{_DYNAMO_CACHE_ROOT}/{cache_key}"
     lock = f"{_DYNAMO_CACHE_ROOT}/.{cache_key}.lock"
+    checkout_cmd = (
+        f"git checkout {dynamo_hash}"
+        if is_commit_sha(dynamo_hash)
+        else f"git fetch origin {shlex.quote(dynamo_hash)} && git checkout FETCH_HEAD"
+    )
     return (
         f"echo 'Installing dynamo from source ({dynamo_hash}, /configs cache)...' && "
         f"mkdir -p {_DYNAMO_CACHE_ROOT} && "
@@ -1538,8 +1597,8 @@ def _hash_cached_source_install(dynamo_hash: str, cargo_patches: list[str] | Non
         f"pip install --break-system-packages --force-reinstall --quiet maturin && "
         # Clone + build the runtime wheel.
         f"DYN_BUILD_DIR=$(mktemp -d) && cd $DYN_BUILD_DIR && "
-        f"{_git_clone_cmd()} clone https://github.com/ai-dynamo/dynamo.git && "
-        f"cd dynamo && git checkout {dynamo_hash} && "
+        f"{_git_clone_cmd()} clone {shlex.quote(repo_url)} dynamo && "
+        f"cd dynamo && {checkout_cmd} && "
         f"{override_cmd}"
         f"cd lib/bindings/python/ && "
         f'export RUSTFLAGS="${{RUSTFLAGS:-}} -C target-cpu=native --cfg tokio_unstable" && '
@@ -1673,6 +1732,9 @@ class DynamoConfig:
         top_of_tree: Clone repo at HEAD (latest)
         wheel: ai-dynamo package version to install via staged wheels. The
                matching ai-dynamo-runtime wheel is installed automatically.
+        source: One block for all of the above: ``git`` + ``rev`` (commit, tag,
+               or ``refs/pull/<n>/head``; ``srtctl apply`` pins it to ``sha``),
+               ``pypi``, or ``wheel``. Cannot be combined with the legacy fields.
         request_plane: Request plane to use (default: "tcp"). Valid values: "nats", "tcp", "http"
         event_plane: Event plane override, sets DYN_EVENT_PLANE (default: None — follow
                      the Dynamo image's own default). Valid values: "nats", "zmq"
@@ -1689,6 +1751,8 @@ class DynamoConfig:
     hash: str | None = None
     top_of_tree: bool = False
     wheel: str | None = None
+    # Which Dynamo to install: exactly one of git+rev, pypi, or wheel.
+    source: DynamoSourceConfig | None = None
     request_plane: str = "tcp"
     event_plane: str | None = None
     sidecar: bool = False
@@ -1705,6 +1769,27 @@ class DynamoConfig:
     cargo_patches: list[str] | None = None
 
     def __post_init__(self) -> None:
+        if self.source is not None:
+            legacy = [
+                name
+                for name, on in (
+                    ("hash", self.hash is not None),
+                    ("top_of_tree", self.top_of_tree),
+                    ("wheel", self.wheel is not None),
+                    ("cargo_patches", bool(self.cargo_patches)),
+                )
+                if on
+            ]
+            if legacy:
+                raise ValueError("dynamo.source cannot be combined with dynamo." + ", dynamo.".join(legacy))
+            if self.source.pypi is not None:
+                object.__setattr__(self, "version", self.source.pypi)
+            elif self.source.wheel is not None:
+                object.__setattr__(self, "wheel", self.source.wheel)
+            else:
+                object.__setattr__(self, "hash", self.source.checkout)
+                object.__setattr__(self, "cargo_patches", list(self.source.patches) if self.source.patches else None)
+
         install_sources = [
             ("hash", self.hash is not None),
             ("top_of_tree", self.top_of_tree),
@@ -1820,7 +1905,10 @@ class DynamoConfig:
         # to ~10 sec lustre access for repeat hashes. top_of_tree skips the
         # cache (no stable key) and always live-builds.
         if self.hash is not None:
-            return _hash_cached_source_install(self.hash, self.cargo_patches)
+            repo_url = (
+                self.source.git if self.source is not None and self.source.git else DynamoSourceConfig.DEFAULT_GIT
+            )
+            return _hash_cached_source_install(self.hash, self.cargo_patches, repo_url=repo_url)
 
         return _live_source_install_for_top_of_tree()
 
@@ -1934,6 +2022,12 @@ class InfraConfig:
 # Main Configuration Dataclass
 # ============================================================================
 
+# Recipe schema versions. A recipe without a top-level `schema:` key is version 1
+# (the pre-2.0 layout); version 2 is the 2.0 layout. The loader accepts every
+# supported version; `srtctl migrate` rewrites a recipe to the current one.
+CURRENT_SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS: tuple[int, ...] = (1, 2)
+
 
 @dataclass(frozen=True)
 class SrtConfig:
@@ -1948,6 +2042,20 @@ class SrtConfig:
     name: str
     model: ModelConfig
     resources: ResourceConfig
+
+    # Recipe schema version (YAML key `schema`). Absent means 1, the pre-2.0
+    # layout. `schema: 2` selects the 2.0 layout; `srtctl migrate` upgrades a
+    # recipe in place. Both versions load on main.
+    schema_version: int = field(
+        default=1,
+        metadata={
+            "marshmallow_field": fields.Integer(
+                data_key="schema",
+                load_default=1,
+                validate=validate.OneOf(SUPPORTED_SCHEMA_VERSIONS),
+            )
+        },
+    )
 
     slurm: SlurmConfig = field(default_factory=SlurmConfig)
     backend: Annotated[BackendConfig, BackendConfigField()] = field(default_factory=SGLangProtocol)
@@ -1980,6 +2088,16 @@ class SrtConfig:
     # default_host_setup; a recipe that sets this block replaces that default.
     host_setup: HostSetupConfig = field(default_factory=HostSetupConfig)
 
+    # Long-running processes launched next to the job: generic sidecars (an
+    # experimental router built from a PR) and typed ones (a standalone Mooncake
+    # store per worker node). See docs/services.md.
+    services: list[ServiceConfig] = field(default_factory=list)
+
+    # Post-benchmark / eval-only evaluation dispatch: extra env forwarded into the
+    # eval process and an optional command override. Replaces the downstream
+    # source patch that used to extend the passthrough list in do_sweep.py.
+    post_eval: PostEvalConfig = field(default_factory=PostEvalConfig)
+
     # Virtual identity — declares what *should* be running (verified against fingerprint)
     identity: IdentityConfig = field(default_factory=IdentityConfig)
 
@@ -1995,13 +2113,71 @@ class SrtConfig:
         self._validate_telemetry()
         self._validate_mooncake_kv_store()
         self._validate_het_jobs()
+        self._validate_colocated_decode()
         self._validate_dedicated_node_placement()
         self._validate_trtllm_serve()
         self._validate_vllm_frontend()
         self._validate_static_router_frontend()
         self._validate_dynamo_sidecar()
         self._validate_host_setup()
+        self._validate_benchmark_type()
+        self._validate_services()
         self._warn_dp_launch_mode()
+
+    def _validate_services(self) -> None:
+        """Whole-list checks for ``services:``: unique names, then each kind's recipe-level rules.
+
+        Per-entry checks (empty command, moving-branch source rev, ...) live on
+        ``ServiceConfig.__post_init__``; a kind's ``validate`` sees the full
+        recipe (a ``mooncake-store`` needs ``backend.mooncake_kv_store``).
+        """
+        from srtctl.services.registry import get_service_kind
+
+        seen: set[str] = set()
+        for service in self.services:
+            if service.name in seen:
+                raise ValidationError(f"services[].name must be unique; duplicate: {service.name!r}")
+            seen.add(service.name)
+            get_service_kind(service.type).validate(service, self)
+
+    def _validate_benchmark_type(self) -> None:
+        """Reject a benchmark.type that no runner is registered for.
+
+        An unknown type (a typo like ``gsm8k-bench``, or a removed one) currently
+        loads fine and only fails deep in the benchmark stage after a full
+        allocation. Catch it at load time against the registry, plus the special
+        ``manual`` type (no runner; the server just comes up ready). Import is
+        lazy and guarded so a registry import hiccup never blocks a load.
+        """
+        btype = self.benchmark.type
+        try:
+            import srtctl.benchmarks  # noqa: F401 - importing the package registers every runner
+            from srtctl.benchmarks.base import benchmark_config_fields, list_benchmarks
+
+            allowed = set(list_benchmarks()) | {"manual"}
+        except Exception:  # noqa: BLE001 - never block a config load on the registry import
+            return
+        if btype not in allowed:
+            raise ValueError(f"Unknown benchmark.type {btype!r}. Available: {', '.join(sorted(allowed))}")
+
+        # Per-type field split: a field set for a type whose runner never reads it
+        # is a silent no-op today (isl on gsm8k, num_shots on sa-bench). Schema 2
+        # rejects it; schema 1 recipes get a warning so the corpus keeps loading.
+        accepted = benchmark_config_fields(btype)
+        stray = sorted(
+            item.name
+            for item in dataclasses.fields(BenchmarkConfig)
+            if item.name not in accepted and getattr(self.benchmark, item.name) != _dataclass_default(item)
+        )
+        if not stray:
+            return
+        message = (
+            f"benchmark.type {btype!r} does not use {', '.join(stray)}; fields it accepts: "
+            f"{', '.join(sorted(accepted))}"
+        )
+        if self.schema_version >= 2:
+            raise ValueError(message)
+        logger.warning("%s (a schema: 2 recipe would be rejected)", message)
 
     def _validate_host_setup(self) -> None:
         """Reject host_setup blocks that would fail or hang mid-job.
@@ -2222,6 +2398,52 @@ class SrtConfig:
                 "het_jobs=true (a dedicated frontend/client node is not carved out of a het allocation)"
             )
 
+    def _validate_colocated_decode(self) -> None:
+        """A colocated decode layout (``decode_nodes: 0``, ``roles.decode.nodes: colocate``)
+        reserves no nodes of its own, so every decode worker has to fit on the GPUs the
+        prefill workers leave free. Run the backend's real packer against a placeholder
+        node list of ``prefill_nodes`` entries and turn its failure into a load-time error
+        instead of a ``Not enough nodes`` crash inside the SLURM job.
+        """
+        res = self.resources
+        if not res.is_disaggregated or res.decode_nodes != 0 or not res.num_decode:
+            return
+        if (res.prefill_nodes or 0) < 1 or not res.num_prefill:
+            raise ValidationError(
+                "decode colocation (roles.decode.nodes: colocate / resources.decode_nodes: 0) needs at least "
+                "one prefill node and one prefill worker to share"
+            )
+        if self.total_nodes != res.total_nodes:
+            return  # the backend packs prefill and decode across extra nodes itself (vLLM)
+        capacity = res.prefill_nodes * res.gpus_per_node
+        demand = res.prefill_gpus + res.decode_gpus
+        layout = (
+            f"{res.num_prefill} prefill x {res.gpus_per_prefill} GPU(s) + "
+            f"{res.num_decode} decode x {res.gpus_per_decode} GPU(s) = {demand} GPU(s) on "
+            f"{res.prefill_nodes} node(s) x {res.gpus_per_node} GPU(s) = {capacity} GPU(s)"
+        )
+        if demand > capacity:
+            raise ValidationError(f"colocated decode workers do not fit on the prefill nodes: {layout}")
+        try:
+            self.backend.allocate_endpoints(
+                num_prefill=res.num_prefill,
+                num_decode=res.num_decode,
+                num_agg=0,
+                gpus_per_prefill=res.gpus_per_prefill,
+                gpus_per_decode=res.gpus_per_decode,
+                gpus_per_agg=res.gpus_per_agg,
+                gpus_per_node=res.gpus_per_node,
+                available_nodes=[f"node{i}" for i in range(res.prefill_nodes)],
+                spread_workers=res.spread_workers,
+            )
+        except (ValueError, IndexError) as exc:
+            # The packer raises ValueError when it runs out of nodes and IndexError when a
+            # partial-node worker overflows the last node; both mean "does not fit".
+            detail = str(exc) or "ran out of free GPUs on the prefill nodes"
+            raise ValidationError(
+                f"colocated decode workers cannot be packed onto the prefill nodes ({layout}): {detail}"
+            ) from exc
+
     def _validate_dedicated_node_placement(self):
         """A dedicated node is wasted if a placement override routes the
         orchestrator/client somewhere else — the reserved node would then sit
@@ -2272,9 +2494,9 @@ class SrtConfig:
 
             if not (prefill_ok or decode_ok):
                 raise ValidationError(
-                    "mooncake_kv_store is set but neither sglang_config.prefill nor "
-                    "sglang_config.decode has 'disaggregation-transfer-backend: mooncake'. "
-                    "Add it to both modes (and 'disaggregation-ib-device') so workers "
+                    "a mooncake-master service is configured but neither roles.prefill.args nor "
+                    "roles.decode.args has 'disaggregation-transfer-backend: mooncake'. "
+                    "Add it to both roles (and 'disaggregation-ib-device') so workers "
                     "actually use the mooncake master srtslurm launches for you."
                 )
         elif backend_type == "vllm":
@@ -2299,8 +2521,8 @@ class SrtConfig:
 
             if not (prefill_ok or decode_ok):
                 raise ValidationError(
-                    "mooncake_kv_store is set but neither vllm_config.prefill nor "
-                    "vllm_config.decode has a kv-transfer-config that references a "
+                    "a mooncake-master service is configured but neither roles.prefill.args nor "
+                    "roles.decode.args has a kv-transfer-config that references a "
                     "Mooncake connector. Set kv-transfer-config to a JSON value whose "
                     "kv_connector is MooncakeStoreConnector (or MultiConnector wrapping "
                     "one) so workers actually use the mooncake master srtslurm launches "
@@ -2640,9 +2862,15 @@ class SrtConfig:
     @classmethod
     def from_yaml(cls, yaml_path: Path) -> "SrtConfig":
         from srtctl.core.config import expand_observability, expand_trtllm_serve_defaults
+        from srtctl.core.placement import expand_placement
+        from srtctl.core.roles import expand_roles
+        from srtctl.services.normalize import expand_services
 
         with open(yaml_path) as f:
             data = yaml.safe_load(f)
+        expand_roles(data)
+        expand_placement(data)
+        expand_services(data)
         expand_observability(data)
         expand_trtllm_serve_defaults(data)
         schema = cls.Schema()
