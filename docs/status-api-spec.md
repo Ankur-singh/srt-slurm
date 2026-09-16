@@ -38,6 +38,23 @@ Behaviors of the native collector on top of the contract:
 - `status` and `stage` are validated against `srtctl.contract.JobStatus` and `JobStage`; anything else is HTTP 422.
 - Bodies over 1 MiB are rejected with 413 before they are read.
 
+## Web UI
+
+`GET /` serves a single-page UI with no external dependencies: a jobs table (filter by text, status and cluster; elapsed time ticks for active jobs), a detail pane per job (cluster, exit code, duration, model, resources, head node, recipe, log dir, logs URL, the event timeline with deltas, and the raw metadata), and a live global event feed that follows `/api/events` with the cursor. Poll interval is selectable (2 s, 5 s, 15 s, paused). Arrow keys move between jobs; clicking a job id in the feed opens it.
+
+The page itself needs no token (it is static and reveals nothing). It sends the read token the viewer pastes once as `Authorization: Bearer` on every API call and keeps it in the browser's `localStorage`. Opening `/#token=<read token>` seeds it and strips the fragment from the URL; fragments are never sent to the server. `HEAD` is answered like `GET` without a body, for uptime checkers.
+
+### Hosting the page elsewhere
+
+The same `index.html` can be served by any static web server (a Caddy on a corporate network, `python -m http.server`) or opened from a file, and pointed at a collector on another host: set the API base in the header field or open the page with `#api=https://collector.example.com` (also remembered in `localStorage`). Browsers then need the collector's permission for that origin, which is off by default:
+
+```bash
+srtctl status-server --host 0.0.0.0 --cors-origin https://zhongshan.example      # repeatable
+srtctl status-server --host 0.0.0.0 --cors-origin '*'                            # any origin, including a page opened from a file
+```
+
+With a matching `Origin`, GET and HEAD responses (errors included, so the page can show a 401) carry `Access-Control-Allow-Origin`, and the `OPTIONS` preflight is answered before auth with `Access-Control-Allow-Headers: Authorization` and `Access-Control-Allow-Methods: GET, HEAD, OPTIONS`. Writes are never offered cross-origin. This is safe to enable because the API uses no cookies and a token stored by one origin's `localStorage` cannot be read by another; a page from an origin that is not listed simply cannot call the API from the browser, and every call still needs the token.
+
 ## Authentication
 
 Tokens are bearer tokens read from the environment on both sides. Nothing token-shaped ever goes into a recipe or `srtslurm.yaml`: the resolved config is written to the lockfile and copied into the log directory that `reporting.s3` uploads.
@@ -50,7 +67,7 @@ Tokens are bearer tokens read from the environment on both sides. Nothing token-
 
 Rules:
 
-- `GET /api/health` never needs a token and returns only `{"status": "ok"}`.
+- `GET /api/health` never needs a token and returns only `{"status": "ok"}`. `GET /` and `/index.html` (the UI) are static and open too.
 - Authentication runs before body parsing and routing, so an unauthenticated caller gets 401 and learns nothing else: not whether a job exists, not whether the body parsed.
 - Missing or wrong token: 401 with `WWW-Authenticate: Bearer`. Read token on a write route: 403. Tokens are compared in constant time.
 - With no write token the server is open. That is only allowed on loopback, or with `--allow-unauthenticated` for a network that is trusted end to end (a cluster login node reachable only from its compute nodes). A read token without a write token is a startup error.

@@ -23,6 +23,12 @@ guards every write and also grants reads; the optional ``$SRTCTL_STATUS_READ_TOK
 grants reads only. ``/api/health`` is always open. Binding to anything but
 loopback without a token is refused unless ``--allow-unauthenticated`` says the
 network is trusted (a cluster's internal network, for example).
+
+``GET /`` serves ``ui/index.html``, a dependency-free single page (jobs table,
+per-job facts and event timeline, live global event feed) that talks to the
+same ``/api`` routes with the read token the viewer pastes once. The same page
+can be hosted elsewhere (a corp-network web server, a file) and pointed at this
+API with ``#api=``; the collector then needs ``--cors-origin`` for that origin.
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ import json
 import logging
 import os
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -69,6 +76,10 @@ DEFAULT_READ_TOKEN_ENV = "SRTCTL_STATUS_READ_TOKEN"
 # used to fill the disk.
 MAX_BODY_BYTES = 1 << 20
 HEALTH_PATH = "/api/health"
+# The single-page UI. It is static and reveals nothing, so it is served without
+# a token; every API call the page makes carries the token the viewer pasted.
+UI_DIR = Path(__file__).with_name("ui")
+UI_PATHS = frozenset({"/", "/index.html"})
 
 _JOB_ROUTE = re.compile(r"^/api/jobs/(?P<job_id>[^/]+)$")
 _JOB_EVENTS_ROUTE = re.compile(r"^/api/jobs/(?P<job_id>[^/]+)/events$")
@@ -170,6 +181,54 @@ def resolve_auth(
                 "--allow-unauthenticated when the network itself is trusted, such as a cluster login node."
             )
     return AuthPolicy(write_token=write_token, read_token=read_token)
+
+
+@dataclass(frozen=True)
+class CorsPolicy:
+    """Opt-in CORS for a UI served from another origin (``--cors-origin``).
+
+    Off by default: no ``Access-Control-*`` header is ever sent and ``OPTIONS``
+    is 404. With origins configured, a matching ``Origin`` gets
+    ``Access-Control-Allow-Origin`` on every response, errors included, so the
+    browser can surface a 401 instead of a generic network error. Preflights are
+    answered before auth because browsers send them without the token. Only GET
+    and HEAD are offered cross-origin: the UI reads, it never writes. ``"*"``
+    allows any origin, including the ``null`` origin of a page opened from a
+    file. This is safe because the API uses no cookies and a token stored by one
+    origin's localStorage is unreadable to every other origin.
+    """
+
+    origins: frozenset[str] = frozenset()
+
+    @classmethod
+    def from_origins(cls, origins: Iterable[str]) -> CorsPolicy:
+        return cls(frozenset(origin.strip().rstrip("/") for origin in origins if origin.strip()))
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.origins)
+
+    def allow_origin(self, origin: str | None) -> str | None:
+        if not origin or not self.enabled:
+            return None
+        if "*" in self.origins:
+            return "*"
+        return origin if origin.rstrip("/") in self.origins else None
+
+    def headers(self, origin: str | None) -> dict[str, str]:
+        allowed = self.allow_origin(origin)
+        return {"Access-Control-Allow-Origin": allowed, "Vary": "Origin"} if allowed else {}
+
+    def preflight(self, origin: str | None) -> dict[str, str]:
+        headers = self.headers(origin)
+        if not headers:
+            raise ApiError(HTTPStatus.FORBIDDEN, "CORS is not enabled for this origin")
+        return {
+            **headers,
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "Authorization",
+            "Access-Control-Max-Age": "600",
+        }
 
 
 # --------------------------------------------------------------------- routing
@@ -317,7 +376,7 @@ def _parse_json(raw: bytes | None) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------- server
 
 
-def _handler_class(store: StatusStore, auth: AuthPolicy) -> type[BaseHTTPRequestHandler]:
+def _handler_class(store: StatusStore, auth: AuthPolicy, cors: CorsPolicy) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "srtctl-status-server"
         protocol_version = "HTTP/1.1"
@@ -338,18 +397,42 @@ def _handler_class(store: StatusStore, auth: AuthPolicy) -> type[BaseHTTPRequest
         def do_DELETE(self) -> None:
             self._handle("DELETE")
 
+        def do_HEAD(self) -> None:
+            # Uptime checkers and proxies probe with HEAD; answer like GET without a body.
+            self._handle("HEAD")
+
+        def do_OPTIONS(self) -> None:
+            # CORS preflight. Browsers send it without the token, so it is answered
+            # before auth; it discloses only whether this origin may call the API.
+            try:
+                self._read_body()
+                if not cors.enabled:
+                    raise ApiError(HTTPStatus.NOT_FOUND, "No route for OPTIONS")
+                self._send(HTTPStatus.NO_CONTENT, b"", "text/plain", cors.preflight(self.headers.get("Origin")), True)
+            except ApiError as exc:
+                self._send(
+                    exc.status, json.dumps({"detail": exc.detail}).encode(), "application/json", exc.headers, False
+                )
+
         def _handle(self, method: str) -> None:
-            """Order matters: size cap, then auth, then JSON parsing, then routing.
+            """Order matters: size cap, then the static UI, then auth, then JSON parsing, then routing.
 
             An unauthenticated caller therefore learns nothing from the response,
             not even whether the body parsed or the job exists.
             """
+            head_only = method == "HEAD"
+            effective = "GET" if head_only else method
+            cors_headers = cors.headers(self.headers.get("Origin"))
             headers: dict[str, str] = {}
             try:
                 raw = self._read_body()
                 path = urlparse(self.path).path.rstrip("/") or "/"
-                auth.check(method, path, self.headers.get("Authorization"))
-                status, body = route(store, method, self.path, _parse_json(raw))
+                if effective == "GET" and path in UI_PATHS:
+                    page = (UI_DIR / "index.html").read_bytes()
+                    self._send(HTTPStatus.OK, page, "text/html; charset=utf-8", cors_headers, head_only)
+                    return
+                auth.check(effective, path, self.headers.get("Authorization"))
+                status, body = route(store, effective, self.path, _parse_json(raw))
             except ApiError as exc:
                 if exc.status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
                     logger.info("%s %s %s from %s", exc.status.value, method, self.path, self.address_string())
@@ -359,7 +442,9 @@ def _handler_class(store: StatusStore, auth: AuthPolicy) -> type[BaseHTTPRequest
             except Exception:
                 logger.exception("Unhandled error serving %s %s", method, self.path)
                 status, body = HTTPStatus.INTERNAL_SERVER_ERROR, {"detail": "Internal server error"}
-            self._send_json(status, body, headers)
+            # CORS headers ride on every response, errors included, so a browser
+            # page can tell a 401 from a blocked request.
+            self._send(status, json.dumps(body).encode(), "application/json", {**cors_headers, **headers}, head_only)
 
         def _read_body(self) -> bytes | None:
             header = self.headers.get("Content-Length")
@@ -376,18 +461,22 @@ def _handler_class(store: StatusStore, auth: AuthPolicy) -> type[BaseHTTPRequest
                 return None
             return self.rfile.read(length)
 
-        def _send_json(self, status: HTTPStatus, body: dict[str, Any], headers: dict[str, str]) -> None:
-            data = json.dumps(body).encode()
+        def _send(
+            self, status: HTTPStatus, data: bytes, content_type: str, headers: dict[str, str], head_only: bool
+        ) -> None:
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
             for name, value in headers.items():
                 self.send_header(name, value)
             if self.close_connection:
                 # Tell keep-alive clients not to reuse a connection whose body was never drained.
                 self.send_header("Connection", "close")
             self.end_headers()
-            self.wfile.write(data)
+            if not head_only:
+                self.wfile.write(data)
 
     return Handler
 
@@ -398,13 +487,15 @@ def make_server(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     auth: AuthPolicy | None = None,
+    cors: CorsPolicy | None = None,
 ) -> ThreadingHTTPServer:
     """Bind a server for ``store``. ``port=0`` picks a free port; read it back from ``server.server_address``.
 
     ``auth=None`` means no authentication; callers other than tests should go
-    through ``resolve_auth`` so the loopback rule is applied.
+    through ``resolve_auth`` so the loopback rule is applied. ``cors=None``
+    means CORS off.
     """
-    server = ThreadingHTTPServer((host, port), _handler_class(store, auth or AuthPolicy()))
+    server = ThreadingHTTPServer((host, port), _handler_class(store, auth or AuthPolicy(), cors or CorsPolicy()))
     server.daemon_threads = True
     return server
 
@@ -417,16 +508,21 @@ def serve(
     token_env: str = DEFAULT_TOKEN_ENV,
     read_token_env: str = DEFAULT_READ_TOKEN_ENV,
     allow_unauthenticated: bool = False,
+    cors_origins: Iterable[str] = (),
 ) -> None:
     """Run the collector until interrupted."""
     auth = resolve_auth(
         host, token_env=token_env, read_token_env=read_token_env, allow_unauthenticated=allow_unauthenticated
     )
+    cors = CorsPolicy.from_origins(cors_origins)
     store = StatusStore((db_path or DEFAULT_DB_PATH).expanduser())
     store.init()
-    server = make_server(store, host=host, port=port, auth=auth)
+    server = make_server(store, host=host, port=port, auth=auth, cors=cors)
     bound_host, bound_port = server.server_address[0], server.server_address[1]
     print(f"srtctl status-server listening on http://{bound_host}:{bound_port} (db: {store.db_path})")
+    print(f"UI: http://{bound_host}:{bound_port}/  (paste the read token once; the browser keeps it in localStorage)")
+    if cors.enabled:
+        print(f"cors: GET/HEAD allowed from {', '.join(sorted(cors.origins))}")
     if auth.enabled:
         read = f", read token from ${read_token_env}" if auth.read_token else ""
         print(f"auth: bearer token required on every route except {HEALTH_PATH} (write token from ${token_env}{read})")
@@ -478,6 +574,16 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Listen beyond loopback with no token set; only for a network that is trusted end to end",
     )
+    parser.add_argument(
+        "--cors-origin",
+        action="append",
+        default=[],
+        metavar="ORIGIN",
+        help=(
+            "Let the UI served from this origin call the API from a browser (repeatable; "
+            "'*' allows any origin, including a page opened from a file). Read-only routes only. Off by default"
+        ),
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -495,6 +601,7 @@ def main(argv: list[str] | None = None) -> None:
         token_env=args.token_env,
         read_token_env=args.read_token_env,
         allow_unauthenticated=args.allow_unauthenticated,
+        cors_origins=args.cors_origin,
     )
 
 
