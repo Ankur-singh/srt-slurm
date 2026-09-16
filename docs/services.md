@@ -63,7 +63,9 @@ services:
     options:                     # kind-specific knobs (nats: max_payload_mb; exporters: port, collect_interval_ms)
       max_payload_mb: 24
     placement:
-      node: head                 # head | infra | dedicated | prefill | decode | agg | workers
+      node: head                 # head | infra | dedicated | prefill | decode | agg | workers | compute | all
+      pool: train                # or: ride on the nodes another service owns (replaces node)
+    nodes: 2                     # own whole nodes: a pool added to the allocation next to the roles' nodes
     start: after_frontend        # infra | before_workers | after_frontend
     readiness:                   # optional probe, checked on every service node; typed kinds have default ports
       port: 9000                 # or tcp: {port} / http: {port, path, status} / log: {pattern}
@@ -98,11 +100,14 @@ services:
 | `args` | `[]` | Appended to `command`. Handy with typed services that supply the command. |
 | `container` | type fallback, then job container | Aliases resolve through `srtslurm.yaml` like every other container key. |
 | `env` | `{}` | Merged over the type's defaults; see [Environment](#environment). |
-| `placement.node` | type default | `generic`: `head`. See [Placement](#placement). |
+| `placement.node` | type default | `generic`: `head`. See [Placement](#placement). `compute` is every engine worker node plus every pool; `all` adds the head, infra and client nodes. |
+| `placement.pool` | none | Run on the nodes another service owns, one instance per node of that pool. Replaces `node`. See [pools.md](pools.md). |
+| `nodes` | none | Whole nodes this service owns: its pool, added to the allocation after the engine roles' nodes, in declaration order. Any number of services may own nodes, next to engine roles or without them. An owner is placed on its own pool (`placement.node: workers`). Not supported with `resources.het_jobs`. See [pools.md](pools.md). |
 | `start` | type default | `etcd`, `nats`: `infra`. `mooncake-master`, `mooncake-store`: `before_workers`. `generic` and the exporters: `after_frontend`. |
 | `readiness` | type default | One probe per node: `port` / `tcp`, `http`, or `log`, plus `timeout_seconds` and `interval_seconds`. The typed kinds gate on their well-known ports when no probe is written. See [Start Order and Readiness](#start-order-and-readiness). Timing out terminates what this stage started and fails the job. |
 | `inherit_discovery_env` | `true` | Inject the same `ETCD_ENDPOINTS` / `NATS_SERVER` the Dynamo frontend gets. |
 | `critical` | type default | `generic`: `false`. `mooncake-store`: `true`. |
+| `terminal` | `false` | This service is the job's run: the job ends when every instance of every terminal service has exited, with the worst exit code as the job's. The recipe has no benchmark step (`benchmark.type` stays `manual`); combining the two is refused. See [pools.md](pools.md#ending-the-job-with-a-pool). |
 | `preamble` | none | Shell run after the environment is exported and before `command`. |
 | `cpus_per_task`, `cpu_bind`, `srun_options` | none | Pass-through srun knobs for this service's launches. |
 | `source`, `build_command` | none | See [Building From Source](#building-from-source). |
@@ -111,8 +116,11 @@ services:
 `command`, `args`, `env` values, and `preamble` may use these placeholders: `{node}`, `{node_ip}`,
 `{node_id}` (position in the worker list), `{index}` (instance index within the service), `{role}`
 (the `placement.node` value), `{head_node}`, `{head_ip}`, `{infra_node}`, `{infra_ip}`,
-`{master_port}`, `{metadata_port}`. Only those names are substituted; other braces (JSON in an env
-value) are left alone.
+`{master_port}`, `{metadata_port}`, `{gpus_per_node}`, and the service's own node set: `{pool_node}` /
+`{pool_ip}` (its first node), `{pool_nodes}` / `{pool_ips}` (every node, comma-separated, in order),
+`{pool_node_count}`. Only those names are substituted; other braces (JSON in an env value) are left alone.
+
+`{pool_ip}` is the rendezvous for a service that forms its own cluster on the nodes it owns; `{head_ip}` is the job head, an engine node when the service runs on a pool next to engine roles. A torchrun owner reads `--nnodes={pool_node_count} --nproc-per-node={gpus_per_node} --node-rank={index} --master-addr={pool_ip}`; see [pools.md](pools.md#forming-a-cluster-on-a-pool), including why such a service should not carry a `readiness` probe that needs every rank.
 
 ## Implicit Services
 
