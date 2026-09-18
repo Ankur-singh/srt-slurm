@@ -1348,6 +1348,42 @@ class TachometerConfig:
 
 
 @dataclass(frozen=True)
+class NsysObservabilityConfig:
+    """Automatic NVTX tracing and CPU sampling of workers and Dynamo frontends.
+
+    Enabled by ``observability.enabled`` unless explicitly opted out. An
+    explicit top-level ``profiling`` mode takes precedence over this preset.
+    By default the benchmark starts capture after warmup and stops it when
+    measured work finishes. ``including_startup`` captures from process launch
+    through teardown, including initialization and warmup.
+    """
+
+    # Set false to keep other observability signals without launching nsys.
+    enabled: bool = True
+    # measured_workload excludes warmup; including_startup spans process launch through teardown.
+    capture_window: Literal["measured_workload", "including_startup"] = "measured_workload"
+    # Maximum wait for a control acknowledgment or a step's report finalization.
+    report_timeout_secs: int = 1800
+    # Optional container path to libToolsInjection64.so for NVTX injection.
+    nvtx_injection_path: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.capture_window not in {"measured_workload", "including_startup"}:
+            raise ValidationError("observability.nsys.capture_window must be measured_workload or including_startup")
+        if self.report_timeout_secs <= 0:
+            raise ValidationError("observability.nsys.report_timeout_secs must be positive")
+        if self.nvtx_injection_path is not None and not self.nvtx_injection_path.startswith("/"):
+            raise ValidationError("observability.nsys.nvtx_injection_path must be an absolute container path")
+
+    @property
+    def terminate_timeout(self) -> int:
+        """Allow report finalization, then the application tree's shutdown grace."""
+        return self.report_timeout_secs + 150
+
+    Schema: ClassVar[type[Schema]] = Schema
+
+
+@dataclass(frozen=True)
 class ObservabilityConfig:
     """Observability configuration for OTEL tracing.
 
@@ -1376,6 +1412,9 @@ class ObservabilityConfig:
 
     and, for the run's server-side capture:
 
+    * Nsight Systems NVTX tracing and CPU sampling on all worker processes/ranks
+      and Dynamo frontends (``nsys.enabled: false`` opts out).
+      Explicit top-level ``profiling`` takes precedence.
     * native Tachometer collection of every ``/metrics`` endpoint the benchmark
       client does not already poll (see ``TelemetryStageMixin.start_tachometer``
       and ``tachometer`` below).
@@ -1405,6 +1444,7 @@ class ObservabilityConfig:
             and frontends. Requires otel_endpoint to be set. Default: False.
         otel_endpoint: OTEL collector endpoint (e.g. "http://10.0.0.1:4317").
             Required when enable_otel is True.
+        nsys: Automatic Nsight Systems capture, enabled with the master switch.
         tachometer: Native Tachometer capture configuration. Follows ``enabled``
             unless ``tachometer.enabled`` is set explicitly (see
             :class:`TachometerConfig`).
@@ -1420,6 +1460,7 @@ class ObservabilityConfig:
     otel_endpoint: str | None = None
 
     tachometer: TachometerConfig = field(default_factory=TachometerConfig)
+    nsys: NsysObservabilityConfig = field(default_factory=NsysObservabilityConfig)
 
     Schema: ClassVar[type[Schema]] = Schema
 
@@ -3163,9 +3204,33 @@ class SrtConfig:
                 "it names a mandatory provider for a leg that will not run"
             )
 
+    @property
+    def observability_nsys_enabled(self) -> bool:
+        """Use the automatic preset only when no explicit profiler owns the run."""
+        return self.observability.enabled and self.observability.nsys.enabled and not self.profiling.enabled
+
     def _validate_observability(self):
-        """Validate Tachometer collection under observability."""
+        """Validate automatic profiling and Tachometer collection."""
         observability = self.observability
+        if self.observability_nsys_enabled and observability.nsys.capture_window == "measured_workload":
+            # These scripts own warmup and invoke the acknowledged boundary API.
+            # Custom/manual clients receive that API but must invoke it themselves.
+            supported = {"sa-bench", "sglang-bench", "trace-replay", "mooncake-router", "custom", "manual"}
+            if self.benchmark.type not in supported:
+                raise ValidationError(
+                    f"observability.nsys.capture_window: measured_workload has no warmup hooks for "
+                    f"benchmark.type: {self.benchmark.type}; use capture_window: including_startup, "
+                    "disable observability.nsys, or use a custom client with start/stop hooks"
+                )
+            if self.benchmark.type in {"trace-replay", "mooncake-router"} and any(
+                key.replace("_", "-").startswith(("warmup-", "num-warmup-")) and value not in (0, "0", False, None)
+                for key, value in self.benchmark.aiperf_args.items()
+            ):
+                raise ValidationError(
+                    "measured_workload nsys capture uses the bundled script's separate warmup; "
+                    "additional aiperf_args warmup would occur inside capture. Remove those "
+                    "flags or use a custom client with hooks at its actual warmup boundary"
+                )
         tachometer = observability.tachometer
         if not observability.tachometer_enabled:
             return
