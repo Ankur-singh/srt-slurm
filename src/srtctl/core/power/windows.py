@@ -19,7 +19,10 @@ from pathlib import Path
 
 from srtctl.core.power.contract import (
     CLOCK_SOURCE,
+    MAX_LONG_SAMPLE_GAP_WINDOW_FRACTION,
     MAX_SAMPLE_GAP_SECONDS,
+    MAX_TOLERATED_SAMPLE_GAP_SECONDS,
+    MAX_TOLERATED_SAMPLE_GAP_WINDOW_FRACTION,
     SCHEMA_VERSION,
     WINDOWS_DIRNAME,
     Reason,
@@ -363,12 +366,32 @@ def _check_coverage(
         if sequence is None:
             reasons.append(Reason.MEASUREMENT_WINDOW_NOT_BRACKETED)
             continue
-        largest = max((later - earlier for earlier, later in itertools.pairwise(sequence)), default=0.0)
+        intervals = list(itertools.pairwise(sequence))
+        largest = max((later - earlier for earlier, later in intervals), default=0.0)
         gaps[f"{device.hostname}/{device.gpu_uuids[0]}"] = largest
-        if largest > MAX_SAMPLE_GAP_SECONDS:
+        if not _sample_gaps_within_policy(intervals, start=start, end=end):
             reasons.append(Reason.SAMPLE_GAP_EXCEEDED)
 
     return gaps, reasons
+
+
+def _sample_gaps_within_policy(intervals: Sequence[tuple[float, float]], *, start: float, end: float) -> bool:
+    """Allow bounded collection overruns without hiding sustained data loss."""
+    duration = end - start
+    allowed_largest_gap = min(
+        MAX_TOLERATED_SAMPLE_GAP_SECONDS,
+        max(MAX_SAMPLE_GAP_SECONDS, duration * MAX_TOLERATED_SAMPLE_GAP_WINDOW_FRACTION),
+    )
+    largest = max((later - earlier for earlier, later in intervals), default=0.0)
+    if largest > allowed_largest_gap:
+        return False
+
+    long_gap_seconds = sum(
+        max(0.0, min(later, end) - max(earlier, start))
+        for earlier, later in intervals
+        if later - earlier > MAX_SAMPLE_GAP_SECONDS
+    )
+    return long_gap_seconds <= duration * MAX_LONG_SAMPLE_GAP_WINDOW_FRACTION
 
 
 def _bracketing_sequence(times: Sequence[float], start: float, end: float) -> list[float] | None:

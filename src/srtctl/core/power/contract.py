@@ -105,7 +105,16 @@ CPU_SAMPLES_HEADER = (
 # out to be wrong, only the ACPI total is affected, since the component-rail
 # columns and DCGM mode (one already-aggregate value per socket) are unaffected.
 
+# Keep the configured cadence at or below three seconds. For long formal
+# windows, post-processing may tolerate bounded overruns under the additional
+# absolute and cumulative limits below.
 MAX_SAMPLE_GAP_SECONDS = 3.0
+# A single gap may grow with the window, but never exceed 10 seconds or 0.5%
+# of the formal measurement duration. All gaps over the normal budget may
+# cover at most 5% of that duration for any device.
+MAX_TOLERATED_SAMPLE_GAP_SECONDS = 10.0
+MAX_TOLERATED_SAMPLE_GAP_WINDOW_FRACTION = 0.005
+MAX_LONG_SAMPLE_GAP_WINDOW_FRACTION = 0.05
 COLLECT_CYCLE_TIMEOUT_GRACE_SECONDS = 1.0
 
 BENCHMARK_TYPE_SA_BENCH = "sa-bench"
