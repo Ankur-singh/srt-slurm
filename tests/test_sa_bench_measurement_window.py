@@ -144,7 +144,15 @@ def _samples_with_omissions(start, end, omit):
     return derive_observed_devices(rows)
 
 
-def _validate(logs, observed, expected=(("sa-bench", 4),), errors=None):
+def _validate(
+    logs,
+    observed,
+    expected=(("sa-bench", 4),),
+    errors=None,
+    *,
+    sample_interval_seconds=1.0,
+    request_timeout_seconds=1.0,
+):
     return validate_expected_windows(
         power_dir=logs / "power",
         result_root=logs,
@@ -152,6 +160,8 @@ def _validate(logs, observed, expected=(("sa-bench", 4),), errors=None):
         expected_device_keys={device.key for device in observed},
         observed_devices=observed,
         artifact_errors=errors if errors is not None else [],
+        sample_interval_seconds=sample_interval_seconds,
+        request_timeout_seconds=request_timeout_seconds,
     )
 
 
@@ -359,6 +369,26 @@ class TestCoverageValidation:
 
         assert rows[0].power_coverage_valid is False
         assert Reason.SAMPLE_GAP_EXCEEDED in rows[0].reason_codes
+
+    def test_gap_budget_uses_the_recorded_cadence_and_timeout(self, logs):
+        start, end = self._completed(logs)
+        observed = _samples(start, end, step=4.0)
+
+        strict = _validate(
+            logs,
+            observed,
+            sample_interval_seconds=1.0,
+            request_timeout_seconds=1.0,
+        )
+        configured = _validate(
+            logs,
+            observed,
+            sample_interval_seconds=1.0,
+            request_timeout_seconds=1.5,
+        )
+
+        assert strict[0].power_coverage_valid is False
+        assert configured[0].power_coverage_valid is True
 
     def test_long_window_tolerates_a_bounded_sampling_overrun(self, logs):
         start, end = self._completed(logs, end=4640.0, duration=3640.0)
