@@ -200,6 +200,7 @@ Benchmark configuration.
 | `trace_file` | str \| None | `None` | Trace replay benchmark fields (uses aiperf with mooncake_trace dataset type) |
 | `custom_tokenizer` | str \| None | `None` | Custom tokenizer class (e.g., "module.path.ClassName") |
 | `use_chat_template` | bool | `True` | Pass --use-chat-template to benchmark (default: true) |
+| `endpoint` | str \| None | `None` | SA-Bench API path (see benchmark_serving.py --endpoint). |
 | `reuse_http_connections` | bool | `False` | SA-Bench Dynamo adapter: reuse a benchmark-scoped HTTP connection pool. Opt-in to preserve the historical per-request ClientSession behavior. |
 | `command` | str \| None | `None` | Custom benchmark hook. ``command`` is passed to ``bash -lc`` verbatim; srtctl does NOT substitute placeholders like ``{nginx_url}`` or ``{slurm_job_id}``. Render any parameters when generating the recipe. See srtctl.benchmarks.custom.CustomBenchmarkRunner for details. |
 | `container_image` | str \| None | `None` | Image the benchmark client runs in (custom, agentperf); unset uses `model.container`. |
@@ -225,7 +226,7 @@ Benchmark configuration.
 | `mmlu` | MMLU accuracy evaluation benchmark. | `max_tokens`, `num_examples`, `num_threads`, `repeat` |
 | `mooncake-router` | Mooncake Router benchmark for testing KV-aware routing using aiperf. | `itl_threshold_ms`, `mooncake_workload`, `ttft_threshold_ms` |
 | `router` | Router performance benchmark. | `concurrency`, `isl`, `num_requests`, `osl`, `prefix_ratios` |
-| `sa-bench` | SA-Bench throughput and latency benchmark. | `custom_tokenizer`, `dataset_name`, `dataset_path`, `isl`, `num_prompts_mult`, `num_warmup_mult`, `osl`, `random_range_ratio`, `req_rate`, `reuse_http_connections`, `slow_down_sleep_time`, `slow_down_wait_time`, `use_chat_template` |
+| `sa-bench` | SA-Bench throughput and latency benchmark. | `custom_tokenizer`, `dataset_name`, `dataset_path`, `endpoint`, `isl`, `num_prompts_mult`, `num_warmup_mult`, `osl`, `random_range_ratio`, `req_rate`, `reuse_http_connections`, `slow_down_sleep_time`, `slow_down_wait_time`, `use_chat_template` |
 | `sglang-bench` | SGLang benchmark runner. | `isl`, `osl`, `req_rate` |
 | `trace-replay` | Trace replay benchmark using aiperf with a user-provided dataset. | `itl_threshold_ms`, `trace_file`, `ttft_threshold_ms` |
 

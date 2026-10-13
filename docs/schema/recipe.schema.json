@@ -537,6 +537,18 @@
           "description": "Pass --use-chat-template to benchmark (default: true)",
           "default": true
         },
+        "endpoint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "SA-Bench API path (see benchmark_serving.py --endpoint).",
+          "default": null
+        },
         "reuse_http_connections": {
           "type": "boolean",
           "description": "SA-Bench Dynamo adapter: reuse a benchmark-scoped HTTP connection pool. Opt-in to preserve the historical per-request ClientSession behavior.",

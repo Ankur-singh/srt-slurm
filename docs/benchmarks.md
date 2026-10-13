@@ -124,10 +124,13 @@ benchmark:
   osl: 1024                          # Required: Output sequence length
   concurrencies: [256, 512]          # Required: Concurrency levels to test
   req_rate: "inf"                    # Optional: Request rate (default: "inf")
+  endpoint: "/v1/completions"        # Optional: API path (default: "/v1/completions")
   reuse_http_connections: false      # Optional: Reuse HTTP connections (default: false)
 ```
 
 **Concurrencies format**: Can be a list `[128, 256, 512]` or x-separated string `"128x256x512"`.
+
+On `/v1/chat/completions` the frontend renders the chat template itself, so SA-Bench sends the bare prompt as a message instead of rendering it a second time. Keep `use_chat_template: true` there: the template's tokens are reserved inside the `isl` budget, so the served input length still matches `isl`.
 
 When `reuse_http_connections` is enabled, each `benchmark_serving.py` process uses one keep-alive connection pool. Warmup and formal runs remain isolated in separate processes and therefore never share a pool. The option currently applies only to SA-Bench's Dynamo HTTP adapter.
 
