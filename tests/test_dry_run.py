@@ -37,6 +37,13 @@ BASE_CONFIG = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _no_local_cluster_config(tmp_path, monkeypatch):
+    # A developer's srtslurm.yaml in the repo root would add default_mounts rows whose
+    # long paths make rich truncate the cells these tests assert on.
+    monkeypatch.setenv("SRTSLURM_CONFIG", str(tmp_path / "absent-srtslurm.yaml"))
+
+
 def _make_config(overrides: dict | None = None) -> SrtConfig:
     """Build an SrtConfig from BASE_CONFIG with optional overrides merged in.
 
