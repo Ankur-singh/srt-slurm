@@ -145,6 +145,8 @@ class SABenchRunner(BenchmarkRunner):
             dataset_name,
             b.dataset_path or "",
             str(b.reuse_http_connections).lower(),
-            b.endpoint or DEFAULT_SA_BENCH_API_ENDPOINT,
         ]
+        # Trailing optional argument: bench.sh falls back to DEFAULT_SA_BENCH_API_ENDPOINT when it is absent.
+        if b.endpoint:
+            cmd.append(b.endpoint)
         return cmd

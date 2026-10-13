@@ -162,9 +162,8 @@ class TestSABenchRunner:
         )
         cmd = runner.build_command(config, runtime)
         assert "random" in cmd
-        assert cmd[-3] == ""  # empty dataset path
-        assert cmd[-2] == "false"  # per-request HTTP sessions by default
-        assert cmd[-1] == "/v1/completions"
+        assert cmd[-2] == ""  # empty dataset path
+        assert cmd[-1] == "false"  # per-request HTTP sessions by default
 
     def test_build_command_custom_endpoint(self):
         """build_command passes the API path through to bench.sh."""
@@ -235,8 +234,8 @@ class TestSABenchRunner:
 
         cmd = runner.build_command(config, runtime)
 
-        assert cmd[-3] == "/data/bench.jsonl"
-        assert cmd[-2] == "true"
+        assert cmd[-2] == "/data/bench.jsonl"
+        assert cmd[-1] == "true"
 
     def test_http_connection_reuse_schema_default_and_roundtrip(self):
         """The YAML field is typed and remains opt-in when omitted."""
