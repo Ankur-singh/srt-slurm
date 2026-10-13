@@ -1627,6 +1627,21 @@ class VLLMBackend(Backend):
             # or equivalent backports. See docs/sidecars.md for compatibility.
             # VLLM_RUST_FRONTEND_PATH, when configured, is inherited unchanged.
             command.extend(["env", "VLLM_USE_RUST_FRONTEND=1", "python3", "-m", "vllm.entrypoints.cli.main"])
+            # Python `vllm serve` looks every --reasoning-parser value up in its parser registry and
+            # disables the parser by omission, while the Rust frontend it bootstraps defaults to no
+            # parser. So the vllm-rs sentinel `none` (what Dynamo sidecars need) maps to dropping the
+            # flag, and `auto` has no equivalent on this launcher.
+            for key in ("reasoning-parser", "reasoning_parser"):
+                value = config.get(key)
+                if not isinstance(value, str):
+                    continue
+                if value.strip().lower() == "none":
+                    config.pop(key)
+                elif value.strip().lower() == "auto":
+                    raise ValueError(
+                        f"roles.{mode}.args.{key}: `auto` is a vllm-rs selection; the multi-node sidecar "
+                        "launcher runs Python `vllm serve`, which needs a parser name or no flag"
+                    )
         else:
             command.append("vllm-rs")
         command.extend(["serve", model_arg, "--served-model-name", served_model_name])
