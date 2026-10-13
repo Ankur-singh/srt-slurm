@@ -11,6 +11,32 @@ default_account: "your-gpu-account"
 default_partition: "gpu"
 default_time_limit: "04:00:00"
 
+# Cluster-specific GPU behavior. NVIDIA defaults need no configuration.
+# On ROCm/Linux, select one visibility mask and omit the NVIDIA exporter:
+# visible_devices_env: ROCR_VISIBLE_DEVICES
+# default_gpu_exporter: null
+# Or configure your cluster's exporter once; tachometer scrapes it and
+# `telemetry: {enabled: true}` recipes measure GPU power with it (recipe
+# exporter settings still win). `gpu_labels` and `gpu_metrics` say which labels
+# identify a GPU and which metrics to record; unset means DCGM. For
+# rocm/device-metrics-exporter:
+# default_gpu_exporter:
+#   container_image: "docker://rocm/device-metrics-exporter:v1.5.2"
+#   command: "/home/amd/tools/entrypoint.sh"   # pyxis runs `command`, not the image ENTRYPOINT
+#   port: 5000                                  # the port this exporter serves on
+#   kind: custom
+#   gpu_labels:
+#     index: gpu_id
+#     identity: serial_number
+#   gpu_metrics:
+#     power:
+#       metric: gpu_power_usage
+#       scope: amd_device_metrics_exporter_gpu_power_usage
+#     gpu_util:
+#       metric: gpu_gfx_activity
+#     temperature:
+#       metric: gpu_junction_temperature
+
 # Some clusters see intermittent git smart-HTTP failures negotiating HTTP/2
 # against github.com (stalls, or truncated responses git misreports as
 # "could not read Username" auth-prompt failures) from certain network paths.
@@ -49,8 +75,8 @@ use_gpus_per_node_directive: true  # Default: true
 use_segment_sbatch_directive: true  # Default: true
 # Set to true if your cluster requires --exclusive to be set.
 use_exclusive_sbatch_directive: false # Default: false
-# Container registry
-default_container: "/shared/containers/sglang-latest.sqsh"
+
+# Container aliases (optional; a recipe may also name the image directly in model.container)
 containers:
   sglang-latest: "/shared/containers/sglang-v0.4.sqsh"
   sglang-dev: "/shared/containers/sglang-dev.sqsh"
