@@ -221,4 +221,4 @@ env_to_set:
     SRT_NSYS_CONTROL_SCRIPT: /srtctl-runtime/nsys_window.py
     SRT_NSYS_CONTROL_TIMEOUT: 1800
 command: |
-    bash /srtctl-benchmarks/sa-bench/bench.sh http://localhost:8000 128 128 4x8 inf /model Qwen/Qwen3-0.6B false 8 0 0 0.8 10 2 '' true random '' false
+    bash /srtctl-benchmarks/sa-bench/bench.sh http://localhost:8000 128 128 4x8 inf /model Qwen/Qwen3-0.6B false 8 0 0 0.8 10 2 '' true random '' false /v1/completions

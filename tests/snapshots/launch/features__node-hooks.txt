@@ -218,7 +218,7 @@ nvidia-smi --query-gpu=index,ecc.errors.uncorrected.volatile.total --format=csv
     SRT_FRONTEND_HOST: 127.0.0.1
     SRT_FRONTEND_PORT: 8000
 command: |
-    bash /srtctl-benchmarks/sa-bench/bench.sh http://localhost:8000 128 128 4x8 inf /model Qwen/Qwen3-0.6B false 8 0 0 0.8 10 2 '' true random '' false
+    bash /srtctl-benchmarks/sa-bench/bench.sh http://localhost:8000 128 128 4x8 inf /model Qwen/Qwen3-0.6B false 8 0 0 0.8 10 2 '' true random '' false /v1/completions
 
 ## <unnamed>
 nodelist: node-01
