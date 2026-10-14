@@ -162,9 +162,8 @@ class TestSABenchRunner:
         )
         cmd = runner.build_command(config, runtime)
         assert "random" in cmd
-        assert cmd[-3] == ""  # empty dataset path
-        assert cmd[-2] == "false"  # per-request HTTP sessions by default
-        assert cmd[-1] == ""  # dataset caching off by default
+        assert cmd[-2] == ""  # empty dataset path
+        assert cmd[-1] == "false"  # per-request HTTP sessions by default
 
     def test_build_command_custom_endpoint(self):
         """build_command passes the API path through to bench.sh."""
@@ -177,7 +176,7 @@ class TestSABenchRunner:
 
         cmd = runner.build_command(self._endpoint_config("/v1/chat/completions"), runtime)
 
-        assert cmd[-1] == "/v1/chat/completions"
+        assert cmd[-2:] == ["", "/v1/chat/completions"]
 
     def test_build_command_cache_precedes_custom_endpoint(self):
         """The cache and endpoint occupy distinct trailing bench.sh arguments."""
@@ -251,8 +250,8 @@ class TestSABenchRunner:
 
         cmd = runner.build_command(config, runtime)
 
-        assert cmd[-3] == "/data/bench.jsonl"
-        assert cmd[-2] == "true"
+        assert cmd[-2] == "/data/bench.jsonl"
+        assert cmd[-1] == "true"
 
     def test_build_command_passes_container_cache_path(self):
         """bench.sh receives the mount point, never the host path."""

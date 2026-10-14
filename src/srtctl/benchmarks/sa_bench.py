@@ -164,9 +164,12 @@ class SABenchRunner(BenchmarkRunner):
             dataset_name,
             b.dataset_path or "",
             str(b.reuse_http_connections).lower(),
-            dataset_cache_dir,
         ]
-        # Trailing optional argument: bench.sh falls back to DEFAULT_SA_BENCH_API_ENDPOINT when it is absent.
+        # These optional positional arguments form a trailing suffix. Keep legacy
+        # commands unchanged when neither feature is configured, but preserve the
+        # empty cache slot when an endpoint must occupy argument 21.
+        if b.dataset_cache_dir or b.endpoint:
+            cmd.append(dataset_cache_dir)
         if b.endpoint:
             cmd.append(b.endpoint)
         return cmd
