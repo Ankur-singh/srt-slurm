@@ -1343,8 +1343,9 @@ def main(args: argparse.Namespace):
     if args.slow_down_servers is None:
         args.slow_down_servers = []
 
-    prewarm_cache_dir = args.dataset_cache_dir or os.environ.get("SA_BENCH_DATASET_CACHE_DIR")
-    if args.prewarm_dataset_cache:
+    prewarm_cache_dir = getattr(args, "dataset_cache_dir", None) or os.environ.get("SA_BENCH_DATASET_CACHE_DIR")
+    prewarm_dataset_cache = getattr(args, "prewarm_dataset_cache", False)
+    if prewarm_dataset_cache:
         if args.dataset_name != "random":
             raise ValueError(
                 f"--prewarm-dataset-cache only applies to --dataset-name random, got '{args.dataset_name}'"
@@ -1527,7 +1528,7 @@ def main(args: argparse.Namespace):
         else:
             raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
-    if args.prewarm_dataset_cache:
+    if prewarm_dataset_cache:
         # The dataset is on disk now; everything below needs a live server.
         print(f"{_log_stamp()} [cache] prewarm done: {len(input_requests)} prompts ready in {prewarm_cache_dir}")
         return
