@@ -13,6 +13,7 @@ Examples:
   srtctl apply -f config.yaml --sweep            # Submit sweep
   srtctl preflight -f config.yaml                # Check model/container availability
   srtctl dry-run -f config.yaml                  # Dry run
+  srtctl cache-inputs -f config.yaml             # Pre-generate benchmark datasets
   srtctl render -f config.yaml --to ./rendered   # Write the sbatch script for someone else to submit
   srtctl resolve-override -f config.yaml         # Resolve override YAML (no submit)
   srtctl resolve-override -f config.yaml --stdout  # Print to stdout
@@ -132,6 +133,19 @@ Check model and container availability without submitting
 | `-f, --file CONFIG` | required | YAML config file, or file:selector for overrides |
 | `--set KEY=VALUE` |  | Override a recipe value by dotted path before validation (repeatable), e.g. --set health_check.max_attempts=720 or --set 'roles.prefill.args.dist-timeout=1800'. Values parse as YAML scalars or lists; mappings stay literal strings. On override files the value is written into base and every variant. |
 | `--unset KEY` |  | Remove a recipe key by dotted path before validation (repeatable), e.g. --unset health_check |
+
+## `srtctl cache-inputs`
+
+Pre-generate the datasets a recipe's benchmark would otherwise build at run time
+
+| Argument | Default | Description |
+| --- | --- | --- |
+| `-f, --file CONFIG` | required | YAML config file, or file:selector for overrides |
+| `--dry-run` |  | Print the srun command and the datasets it would build, then exit |
+| `--account ACCOUNT` |  | SLURM account (default: recipe slurm.account) |
+| `--partition PARTITION` |  | SLURM partition (default: recipe slurm.partition) |
+| `--time TIME_LIMIT` |  | SLURM time limit (default: recipe slurm.time_limit). Long-ISL sweeps need more than a benchmark run. |
+| `--num-workers NUM_WORKERS` |  | Worker processes for prompt generation (default: auto, min(cpu_count, 8)) |
 
 ## `srtctl monitor`
 

@@ -176,7 +176,23 @@ class TestSABenchRunner:
 
         cmd = runner.build_command(self._endpoint_config("/v1/chat/completions"), runtime)
 
-        assert cmd[-1] == "/v1/chat/completions"
+        assert cmd[-2:] == ["", "/v1/chat/completions"]
+
+    def test_build_command_cache_precedes_custom_endpoint(self):
+        """The cache and endpoint occupy distinct trailing bench.sh arguments."""
+        from dataclasses import replace
+        from unittest.mock import MagicMock
+
+        from srtctl.benchmarks.sa_bench import DATASET_CACHE_MOUNT, SABenchRunner
+
+        runner = SABenchRunner()
+        runtime = MagicMock(frontend_port=8000, model_path="/model", is_hf_model=False)
+        config = self._endpoint_config("/v1/chat/completions")
+        config = replace(config, benchmark=replace(config.benchmark, dataset_cache_dir="/lustre/cache"))
+
+        cmd = runner.build_command(config, runtime)
+
+        assert cmd[-2:] == [DATASET_CACHE_MOUNT, "/v1/chat/completions"]
 
     def _endpoint_config(self, endpoint):
         from srtctl.core.schema import BenchmarkConfig, ModelConfig, ResourceConfig, SrtConfig
@@ -236,6 +252,84 @@ class TestSABenchRunner:
 
         assert cmd[-2] == "/data/bench.jsonl"
         assert cmd[-1] == "true"
+
+    def test_build_command_passes_container_cache_path(self):
+        """bench.sh receives the mount point, never the host path."""
+        from unittest.mock import MagicMock
+
+        from srtctl.benchmarks.sa_bench import DATASET_CACHE_MOUNT, SABenchRunner
+        from srtctl.core.schema import BenchmarkConfig, ModelConfig, ResourceConfig, SrtConfig
+
+        runner = SABenchRunner()
+        runtime = MagicMock(frontend_port=8000, model_path="/model", is_hf_model=False)
+        config = SrtConfig(
+            name="test",
+            model=ModelConfig(path="/model", container="/image", precision="fp4"),
+            resources=ResourceConfig(gpu_type="h100"),
+            benchmark=BenchmarkConfig(
+                type="sa-bench",
+                isl=1024,
+                osl=128,
+                concurrencies="4x8",
+                dataset_cache_dir="/lustre/shared/sa-bench-cache",
+            ),
+        )
+
+        cmd = runner.build_command(config, runtime)
+
+        assert cmd[-1] == DATASET_CACHE_MOUNT
+        assert "/lustre/shared/sa-bench-cache" not in cmd
+
+    def test_get_container_mounts_adds_cache_dir(self, tmp_path):
+        """The host cache dir is created and mounted at the fixed container path."""
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        from srtctl.benchmarks.sa_bench import DATASET_CACHE_MOUNT, SABenchRunner
+        from srtctl.core.schema import BenchmarkConfig, ModelConfig, ResourceConfig, SrtConfig
+
+        runner = SABenchRunner()
+        runtime = MagicMock(container_mounts={Path("/logs"): Path("/logs")})
+        host_cache = tmp_path / "sa-bench-cache"
+        config = SrtConfig(
+            name="test",
+            model=ModelConfig(path="/model", container="/image", precision="fp4"),
+            resources=ResourceConfig(gpu_type="h100"),
+            benchmark=BenchmarkConfig(
+                type="sa-bench", isl=1024, osl=128, concurrencies="4x8", dataset_cache_dir=str(host_cache)
+            ),
+        )
+
+        mounts = runner.get_container_mounts(config, runtime)
+
+        assert host_cache.is_dir()
+        assert mounts[host_cache.resolve()] == Path(DATASET_CACHE_MOUNT)
+        assert mounts[Path("/logs")] == Path("/logs")
+
+    def test_get_container_mounts_unchanged_without_cache_dir(self):
+        """Mounts are untouched when the feature is not configured."""
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        from srtctl.benchmarks.sa_bench import SABenchRunner
+        from srtctl.core.schema import BenchmarkConfig, ModelConfig, ResourceConfig, SrtConfig
+
+        runner = SABenchRunner()
+        runtime = MagicMock(container_mounts={Path("/logs"): Path("/logs")})
+        config = SrtConfig(
+            name="test",
+            model=ModelConfig(path="/model", container="/image", precision="fp4"),
+            resources=ResourceConfig(gpu_type="h100"),
+            benchmark=BenchmarkConfig(type="sa-bench", isl=1024, osl=128, concurrencies="4x8"),
+        )
+
+        assert runner.get_container_mounts(config, runtime) == {Path("/logs"): Path("/logs")}
+
+    def test_dataset_cache_dir_schema_default(self):
+        """The YAML field stays opt-in when omitted."""
+        from srtctl.core.schema import BenchmarkConfig
+
+        assert BenchmarkConfig().dataset_cache_dir is None
 
     def test_http_connection_reuse_schema_default_and_roundtrip(self):
         """The YAML field is typed and remains opt-in when omitted."""
