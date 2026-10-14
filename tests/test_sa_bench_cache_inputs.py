@@ -267,3 +267,30 @@ class TestBenchScriptPrewarmMode:
             assert args[args.index("--random-input-len") + 1] == "8192"
             assert "--max-concurrency" not in args
             assert "--save-result" not in args
+
+    def test_first_failed_dataset_stops_prewarm(self, tmp_path):
+        plan = _plan(_config(tmp_path))
+        command = list(plan.command)
+        command[1] = str(BENCH_SCRIPT)
+        command[-1] = str(plan.cache_dir)
+        harness = "\n".join(
+            [
+                "python3() {",
+                '  if [ "$1" = "-c" ]; then return 0; fi',
+                "  return 17",
+                "}",
+                "export -f python3",
+                shlex.join(command),
+            ]
+        )
+
+        result = subprocess.run(
+            ["bash", "-c", harness],
+            env={**os.environ, PREWARM_ENV_VAR: "1"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 17
+        assert "all 4 dataset(s) ready" not in result.stdout
