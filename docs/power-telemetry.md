@@ -20,15 +20,26 @@ the watts is selected per cluster or recipe (see [GPU exporter labels and metric
   aligned, so the client may run on any node (`benchmark.placement.node`,
   including `dedicated`). Before any server starts, the
   orchestrator probes every allocation node's bare host for a synchronised
-  clock (`timedatectl`, then `chronyc`, then `ntpq`). Each node's verdict is
-  logged (`clock_sync_check: <node> OK (<which daemon vouched>)`) and the
-  probe's output — including the chrony/ntp offset when that path proved it —
-  is kept in `<log_dir>/clock_sync_<node>.out`. A node that cannot prove
+  clock (`timedatectl`, then `chronyc`, then `ntpq`, then kernel
+  `maxerror < 16_000_000` microseconds read through `adjtimex(2)` with
+  `python3`). The fallback follows
+  [systemd's synchronization check](https://github.com/systemd/systemd/commit/bca5a0e),
+  ignoring `STA_UNSYNC` because chrony can leave it set when RTC synchronization
+  is disabled. It supports hosts with no queryable time daemon, such as
+  container-rooted Slurm nodes without systemd or D-Bus. Each node's verdict
+  is logged (`clock_sync_check: <node> OK (<which source vouched>)`) and the
+  probe's output — including the chrony/ntp offset when that path proved it,
+  or every probe's stderr when none did — is kept in
+  `<log_dir>/clock_sync_<node>.out`. A node that cannot prove
   synchronisation aborts the job under `required: true`; under
   `required: false` the run continues but the manifest records the failing
   hosts in `clock_sync_failures`, carries the `clock_sync_unverified` reason,
   and sets `publication_valid: false` — the exit code stays that of the
-  benchmark. Set `clock_sync_check: false` where those tools are unavailable.
+  benchmark. Set `clock_sync_check: false` only where none of those sources
+  is available on the bare host. These probes check synchronization status;
+  the kernel fallback indicates recent clock discipline, not measured clock
+  offset. None of the branches guarantees inter-node skew below the
+  0.5-second measurement-window tolerance.
 - The exporter's power metric (`DCGM_FI_DEV_POWER_USAGE` for DCGM) determines
   which GPUs have power readings; optional utilization and temperature
   readings accompany them. Device identity comes from the exporter's index and identity labels
