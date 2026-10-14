@@ -14,6 +14,7 @@ Examples:
   srtctl preflight -f config.yaml                # Check model/container availability
   srtctl dry-run -f config.yaml                  # Dry run
   srtctl cache-inputs -f config.yaml             # Pre-generate benchmark datasets
+  srtctl bake-image --image model.sqsh --sa-bench  # Bake dependencies into an image
   srtctl render -f config.yaml --to ./rendered   # Write the sbatch script for someone else to submit
   srtctl resolve-override -f config.yaml         # Resolve override YAML (no submit)
   srtctl resolve-override -f config.yaml --stdout  # Print to stdout
@@ -198,6 +199,24 @@ Check environment against a fingerprint
 | --- | --- | --- |
 | `path` | required | Lockfile or output dir to check against |
 | `--json` |  | Output as JSON |
+
+## `srtctl bake-image`
+
+Preinstall dynamo / sa-bench deps / a setup script / a vLLM patch into a new container image
+
+| Argument | Default | Description |
+| --- | --- | --- |
+| `--image SOURCE_IMAGE` | required | Source .sqsh path, or a container alias from srtslurm.yaml |
+| `-o, --output OUTPUT_IMAGE` |  | Output .sqsh path (default: source name plus what was installed) |
+| `--dynamo DYNAMO_VERSION` |  | ai-dynamo version to install, e.g. 1.2.0.dev20260526 |
+| `--sa-bench` |  | Install the Python packages sa-bench needs at runtime |
+| `--script, --setup-script SETUP_SCRIPT` |  | Run a configs/ setup script inside the image before saving it (same as recipe setup_script). Name or path, e.g. install-nixl-dsv4.sh |
+| `--patch FILE.diff` |  | Apply a unified diff to vLLM in the image (repeatable). Name under configs/patches/ or a path. Conflicts abort the bake; no image is kept. |
+| `--force` |  | Overwrite the output image if it already exists |
+| `--time BAKE_TIME_LIMIT` | `0:30:00` | Time limit when srun allocates a node itself (default: 0:30:00) |
+| `--account BAKE_ACCOUNT` |  | SLURM account (default: default_account from srtslurm.yaml) |
+| `--partition BAKE_PARTITION` |  | SLURM partition (default: default_partition from srtslurm.yaml) |
+| `--dry-run` |  | Print the srun command and install script without running them |
 
 ## `srtctl schema-docs`
 
