@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from srtctl.benchmarks.base import SCRIPTS_DIR, BenchmarkRunner, register_benchmark
 
@@ -26,6 +26,7 @@ DATASET_CACHE_MOUNT = "/sa-bench-dataset-cache"
 DEFAULT_NUM_PROMPTS_MULT = 10
 DEFAULT_NUM_WARMUP_MULT = 2
 DEFAULT_RANDOM_RANGE_RATIO = 0.8
+DEFAULT_SA_BENCH_API_ENDPOINT = "/v1/completions"
 
 
 @register_benchmark("sa-bench")
@@ -43,12 +44,35 @@ class SABenchRunner(BenchmarkRunner):
         - benchmark.dataset_name: "random" (default) or "custom"
         - benchmark.dataset_path: Container path to dataset file (required when dataset_name="custom")
         - benchmark.dataset_cache_dir: Host dir for caching generated "random" datasets
+        - benchmark.endpoint: API path, /v1/completions (default) or /v1/chat/completions
         - benchmark.reuse_http_connections: Reuse a benchmark-scoped HTTP connection pool
           for the Dynamo adapter (default: false)
         - benchmark.slow_down_sleep_time / benchmark.slow_down_wait_time: When both are set and
           frontend is sglang, SA-Bench POSTs /slow_down on each decode worker leader (framework-derived
           URLs). Omit either field to disable slow_down.
     """
+
+    # BenchmarkConfig fields this runner reads (beyond the shared ones); see benchmark_config_fields().
+    config_fields: ClassVar[frozenset[str]] = frozenset(
+        {
+            "isl",
+            "osl",
+            "concurrencies",
+            "req_rate",
+            "random_range_ratio",
+            "num_prompts_mult",
+            "num_warmup_mult",
+            "dataset_name",
+            "dataset_path",
+            "dataset_cache_dir",
+            "custom_tokenizer",
+            "use_chat_template",
+            "endpoint",
+            "reuse_http_connections",
+            "slow_down_sleep_time",
+            "slow_down_wait_time",
+        }
+    )
 
     @property
     def name(self) -> str:
@@ -78,6 +102,10 @@ class SABenchRunner(BenchmarkRunner):
         if is_custom and not b.dataset_path:
             errors.append("benchmark.dataset_path is required when dataset_name='custom'")
 
+        api_endpoint = b.endpoint or DEFAULT_SA_BENCH_API_ENDPOINT
+        if not api_endpoint.startswith("/"):
+            errors.append(f"benchmark.endpoint must be an absolute path starting with '/'; got {api_endpoint!r}")
+
         return errors
 
     def build_command(
@@ -86,7 +114,7 @@ class SABenchRunner(BenchmarkRunner):
         runtime: RuntimeContext,
     ) -> list[str]:
         b = config.benchmark
-        r = config.resources
+        r = config.topology
         endpoint = f"http://localhost:{runtime.frontend_port}"
 
         # Format concurrencies as x-separated string if it's a list
@@ -138,6 +166,9 @@ class SABenchRunner(BenchmarkRunner):
             str(b.reuse_http_connections).lower(),
             dataset_cache_dir,
         ]
+        # Trailing optional argument: bench.sh falls back to DEFAULT_SA_BENCH_API_ENDPOINT when it is absent.
+        if b.endpoint:
+            cmd.append(b.endpoint)
         return cmd
 
     def get_container_mounts(self, config: SrtConfig, runtime: RuntimeContext) -> dict[Path, Path]:

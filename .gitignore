@@ -51,6 +51,9 @@ bin/
 configs/nats-server
 configs/etcd
 configs/etcdctl
+configs/process-exporter
+configs/otelcol-contrib
+configs/.otelcol-contrib.release
 configs/*.whl
 configs/*.deb
 configs/*.tar.gz
@@ -64,3 +67,6 @@ wheelhouse/
 configs/dg-*
 configs/flashinfer-cache/
 outputs/*
+
+# Written by hatch-vcs at build time from the git tag
+src/srtctl/_version.py

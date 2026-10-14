@@ -68,6 +68,10 @@ DATASET_NAME=${17:-random}
 DATASET_PATH=${18:-}
 REUSE_HTTP_CONNECTIONS=${19:-false}
 DATASET_CACHE_DIR=${20:-}
+SA_BENCH_API_ENDPOINT=${21:-/v1/completions}
+
+# The dynamo adapter picks the request body from the API path, so it serves both endpoints.
+BENCHMARK_HTTP_ARGS=(--backend "dynamo" --endpoint "$SA_BENCH_API_ENDPOINT")
 
 # Build optional custom tokenizer args
 CUSTOM_TOKENIZER_ARGS=()
@@ -157,7 +161,7 @@ PORT=$(echo "$ENDPOINT" | sed 's|http://||' | cut -d: -f2 | cut -d/ -f1)
 
 WORK_DIR="$(dirname "$0")"
 
-echo "SA-Bench Config: endpoint=${ENDPOINT}; isl=${ISL}; osl=${OSL}; concurrencies=${CONCURRENCIES}; req_rate=${REQ_RATE}; model=${MODEL_NAME}; dataset=${DATASET_NAME}; dataset_path=${DATASET_PATH}; dataset_cache_dir=${DATASET_CACHE_DIR:-<off>}; http_connection_mode=${HTTP_CONNECTION_MODE}"
+echo "SA-Bench Config: endpoint=${ENDPOINT}; isl=${ISL}; osl=${OSL}; concurrencies=${CONCURRENCIES}; req_rate=${REQ_RATE}; model=${MODEL_NAME}; dataset=${DATASET_NAME}; dataset_path=${DATASET_PATH}; dataset_cache_dir=${DATASET_CACHE_DIR:-<off>}; http_connection_mode=${HTTP_CONNECTION_MODE}; api_path=${SA_BENCH_API_ENDPOINT}"
 
 # Parse concurrency list
 IFS='x' read -r -a CONCURRENCY_LIST <<< "$CONCURRENCIES"
@@ -208,7 +212,7 @@ prewarm_dataset_cache() {
         echo "[sa-bench] prewarm ${index}/${total}: num_prompts=${n}"
         python3 -u "${WORK_DIR}/benchmark_serving.py" \
             --model "${MODEL_NAME}" --tokenizer "${MODEL_PATH}" \
-            --backend "dynamo" --endpoint /v1/completions \
+            "${BENCHMARK_HTTP_ARGS[@]}" \
             "${DATASET_ARGS[@]}" \
             --num-prompts "$n" \
             "${RANDOM_LEN_ARGS[@]}" \
@@ -241,15 +245,26 @@ cleanup() { stop_all_profiling; }
 trap cleanup EXIT
 
 # Quick curl to verify endpoint is working
-echo "Verifying endpoint..."
-curl -s "${ENDPOINT}/v1/chat/completions" \
-    -H "Content-Type: application/json" \
-    -d "{
-        \"model\": \"${MODEL_NAME}\",
-        \"messages\": [{\"role\": \"user\", \"content\": \"Hello\"}],
-        \"stream\": false,
-        \"max_tokens\": 10
-    }" | head -c 200
+echo "Verifying endpoint (${SA_BENCH_API_ENDPOINT})..."
+if [[ "$SA_BENCH_API_ENDPOINT" == *"chat/completions"* ]]; then
+    curl -s "${ENDPOINT}${SA_BENCH_API_ENDPOINT}" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"model\": \"${MODEL_NAME}\",
+            \"messages\": [{\"role\": \"user\", \"content\": \"Hello\"}],
+            \"stream\": false,
+            \"max_completion_tokens\": 10
+        }" | head -c 200
+else
+    curl -s "${ENDPOINT}${SA_BENCH_API_ENDPOINT}" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"model\": \"${MODEL_NAME}\",
+            \"prompt\": \"Hello\",
+            \"stream\": false,
+            \"max_tokens\": 10
+        }" | head -c 200
+fi
 echo ""
 
 ulimit -n 65536 2>/dev/null || true  # May fail in containers without CAP_SYS_RESOURCE
@@ -274,7 +289,7 @@ for concurrency in "${CONCURRENCY_LIST[@]}"; do
         python3 -u "${WORK_DIR}/benchmark_serving.py" \
             --model "${MODEL_NAME}" --tokenizer "${MODEL_PATH}" \
             --host "$HOST" --port "$PORT" \
-            --backend "dynamo" --endpoint /v1/completions \
+            "${BENCHMARK_HTTP_ARGS[@]}" \
             --disable-tqdm \
             "${DATASET_ARGS[@]}" \
             --num-prompts "$num_warmup_prompts" \
@@ -308,7 +323,7 @@ for concurrency in "${CONCURRENCY_LIST[@]}"; do
     python3 -u "${WORK_DIR}/benchmark_serving.py" \
         --model "${MODEL_NAME}" --tokenizer "${MODEL_PATH}" \
         --host "$HOST" --port "$PORT" \
-        --backend "dynamo" --endpoint /v1/completions \
+        "${BENCHMARK_HTTP_ARGS[@]}" \
         --disable-tqdm \
         "${DATASET_ARGS[@]}" \
         --num-prompts "$num_prompts" \

@@ -25,7 +25,7 @@ This page explains the sglang router mode for prefill-decode (PD) disaggregation
 
 By default, srtctl uses **Dynamo frontends** to coordinate between prefill and decode workers. This requires NATS/ETCD infrastructure and the `dynamo` package.
 
-**SGLang Router** is an alternative that uses sglang's native `sglang_router` for PD disaggregation.
+**SGLang Router** (`frontend.type: sglang-router`) is an alternative that uses sglang's native `sglang_router` (Model Gateway) for aggregated replicas or PD disaggregation. For a single aggregate worker with no router at all, use `frontend.type: sglang`: the worker binds the public port itself (see `examples/sglang/sglang-direct-agg.yaml`). In schema 1 recipes `frontend.type: sglang` meant the router; `srtctl migrate` rewrites it.
 
 | Feature        | Dynamo Frontends           | SGLang Router              |
 | -------------- | -------------------------- | -------------------------- |
@@ -39,7 +39,7 @@ Enable sglang router in your recipe's `frontend` section:
 
 ```yaml
 frontend:
-  type: sglang
+  type: sglang-router
 ```
 
 That's it. The workers will launch with `sglang.launch_server` instead of `dynamo.sglang`, and the router will handle request distribution.
@@ -50,7 +50,7 @@ Pass extra CLI args to the router:
 
 ```yaml
 frontend:
-  type: sglang
+  type: sglang-router
   args:
     kv-overlap-score-weight: 1
     router-temperature: 0
@@ -74,7 +74,7 @@ Pass environment variables to frontend processes:
 
 ```yaml
 frontend:
-  type: sglang
+  type: sglang-router
   env:
     MY_CUSTOM_VAR: "value"
 ```
@@ -87,18 +87,17 @@ The simplest mode - one router on node 0, no nginx:
 
 ```yaml
 frontend:
-  type: sglang
+  type: sglang-router
   enable_multiple_frontends: false
 ```
 
-```
-┌─────────────────────────────────────────────────────────┐
-│  Node 0                                                 │
-│  ┌──────────────────┐  ┌─────────────┐  ┌────────────┐ │
-│  │  sglang-router   │  │   Prefill   │  │   Decode   │ │
-│  │    :8000         │──│   Worker    │──│   Worker   │ │
-│  └──────────────────┘  └─────────────┘  └────────────┘ │
-└─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    client["Client"] --> router
+    subgraph node0["Node 0"]
+        router["sglang-router :8000"] --> prefill["Prefill worker"]
+        router --> decode["Decode worker"]
+    end
 ```
 
 - Router directly on port 8000
@@ -111,26 +110,24 @@ Nginx load balances across multiple router instances:
 
 ```yaml
 frontend:
-  type: sglang
+  type: sglang-router
   enable_multiple_frontends: true # default
   num_additional_frontends: 9 # default, total = 1 + 9 = 10 routers
 ```
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│  Node 0                               Node 1          Node 2         │
-│  ┌─────────┐  ┌────────────────┐     ┌──────────┐    ┌──────────┐   │
-│  │  nginx  │  │ sglang-router  │     │ sglang-  │    │ sglang-  │   │
-│  │  :8000  │──│    :30080      │     │ router   │    │ router   │   │
-│  └────┬────┘  └────────────────┘     │ :30080   │    │ :30080   │   │
-│       │                               └──────────┘    └──────────┘   │
-│       └──────────────────────────────────┴───────────────┴───────────┘
-│                                                                       │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │
-│  │   Prefill   │  │   Prefill   │  │   Decode    │  │   Decode    │  │
-│  │   Worker 0  │  │   Worker 1  │  │   Worker 0  │  │   Worker 1  │  │
-│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘  │
-└──────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    client["Client"] --> nginx["nginx :8000 (node 0)"]
+    nginx --> router0["sglang-router :30080 (node 0)"]
+    nginx --> router1["sglang-router :30080 (node 1)"]
+    nginx --> router2["sglang-router :30080 (node 2)"]
+    router0 & router1 & router2 --> workers
+    subgraph workers["Workers"]
+        prefill0["Prefill worker 0"]
+        prefill1["Prefill worker 1"]
+        decode0["Decode worker 0"]
+        decode1["Decode worker 1"]
+    end
 ```
 
 - nginx on node 0 listens on port 8000 (public)
@@ -138,7 +135,7 @@ frontend:
 - nginx round-robins requests to routers
 - Routers distributed across nodes using same logic as Dynamo frontends
 
-If the cluster rejects raising open-file limits inside the nginx container, keep the default (`frontend.nginx_raise_ulimit: false` or unset). If you need the previous high-nofile behavior, set `frontend.nginx_raise_ulimit: true` or a cluster default in `srtslurm.yaml` — see [Configuration Reference](config-reference.md#frontend).
+If the cluster rejects raising open-file limits inside the nginx container, keep the default (`frontend.nginx_raise_ulimit: false` or unset). If you need the previous high-nofile behavior, set `frontend.nginx_raise_ulimit: true` or a cluster default in `srtslurm.yaml` — see [Configuration Reference](frontends.md#frontend).
 
 ## How Router Distribution Works
 
@@ -163,12 +160,13 @@ nodes_per_router = ceil((total_nodes - 1) / num_additional_frontends)
 The sglang router needs the **disaggregation bootstrap port** to connect to prefill workers. This must match the `disaggregation-bootstrap-port` in your sglang config:
 
 ```yaml
-backend:
-  sglang_config:
-    prefill:
+roles:
+  prefill:
+    args:
       disaggregation-bootstrap-port: 30001 # Must match
       # ... other config
-    decode:
+  decode:
+    args:
       disaggregation-bootstrap-port: 30001 # Must match
       # ... other config
 ```
@@ -179,11 +177,28 @@ The default bootstrap port is `30001` (matching most recipes). If you use a diff
 
 Workers listen on port `30000` by default. This is standard sglang behavior and doesn't need configuration.
 
+### Metrics
+
+Tachometer (on by default) scrapes this frontend like any other, but the Model Gateway and native
+`sglang.launch_server` workers need two flags that srtctl now passes for you:
+
+- The gateway only starts its Prometheus listener when `--prometheus-port` is given. srtctl adds
+  `--prometheus-port 29000 --prometheus-host 0.0.0.0` (the router's own default port) unless your
+  `frontend.args` set `prometheus-port` / `prometheus-host`, and points tachometer's `frontend*`
+  target at that port, not at the routing port.
+- Workers serve Prometheus `/metrics` on their HTTP port only with `--enable-metrics`. srtctl adds it
+  to every `sglang.launch_server` launch under `frontend.type: sglang-router` unless the role's `args`
+  already set `enable-metrics`. Only the leader rank of a multi-node worker binds the HTTP server, so
+  followers are not targeted.
+
+Dynamo workers are unaffected: they expose metrics on their system port without either flag.
+
 ## Complete Example
 
 Here's a full recipe using sglang router:
 
 ```yaml
+schema: 2
 name: "deepseek-r1-sglang-router"
 
 model:
@@ -194,27 +209,28 @@ model:
 resources:
   gpu_type: "gb300"
   gpus_per_node: 4
-  prefill_nodes: 2
-  prefill_workers: 2
-  decode_nodes: 2
-  decode_workers: 2
 
 frontend:
-  type: sglang
+  type: sglang-router
   enable_multiple_frontends: true
   num_additional_frontends: 3 # 4 total routers
 
-backend:
-  sglang_config:
-    prefill:
+engine: sglang
+roles:
+  prefill:
+    nodes: 2
+    workers: 2
+    args:
       model-path: /model/
       tensor-parallel-size: 4
       disaggregation-mode: prefill
       disaggregation-bootstrap-port: 30001
       disaggregation-transfer-backend: nixl
       # ... other prefill settings
-
-    decode:
+  decode:
+    nodes: 2
+    workers: 2
+    args:
       model-path: /model/
       tensor-parallel-size: 4
       disaggregation-mode: decode

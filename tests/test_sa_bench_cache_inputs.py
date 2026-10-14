@@ -45,6 +45,9 @@ def _config(tmp_path: Path, model_path: str | None = None, **benchmark_overrides
         "dataset_cache_dir": str(tmp_path / "cache"),
     }
     benchmark_fields.update(benchmark_overrides)
+    if benchmark_fields["type"] != "sa-bench":
+        for field in ("dataset_cache_dir", "num_prompts_mult", "num_warmup_mult"):
+            benchmark_fields.pop(field)
 
     return SrtConfig(
         name="prewarm-test",

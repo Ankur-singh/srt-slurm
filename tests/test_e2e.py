@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Cluster-style e2e tests for recipe validation."""
+"""Cluster-style e2e tests for curated example validation."""
 
 import os
 import subprocess
@@ -10,11 +10,27 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from srtctl.cli.interactive import find_examples
 from srtctl.core.config import load_config
 from srtctl.core.topology import allocate_endpoints, endpoints_to_processes
 
-RECIPES_DIR = Path(__file__).parent.parent / "recipes"
+EXAMPLES_DIR = Path(__file__).parent.parent / "examples"
 CI_DIR = Path(__file__).parent.parent / "ci"
+SGLANG_ROUTER_DISAGG = EXAMPLES_DIR / "sglang" / "sglang-router-disagg.yaml"
+MOCKER_EXAMPLE = EXAMPLES_DIR / "mocker" / "dynamo-agg.yaml"
+# Every topology example (Dynamo, native router, and direct frontends for each engine).
+TOPOLOGY_EXAMPLES = tuple(
+    sorted(path for engine in ("sglang", "vllm", "trtllm") for path in (EXAMPLES_DIR / engine).glob("*.yaml"))
+)
+
+
+def test_interactive_discovers_curated_examples():
+    """Interactive mode exposes the curated examples, not a removed recipe tree."""
+    examples = find_examples(Path(__file__).parent.parent)
+
+    assert SGLANG_ROUTER_DISAGG in examples
+    assert MOCKER_EXAMPLE in examples
+    assert len(TOPOLOGY_EXAMPLES) == 27
 
 
 # =============================================================================
@@ -153,109 +169,48 @@ class GB200HetRack:
 # =============================================================================
 
 
-class TestGB200FP4Cluster:
-    """GB200 FP4 1k1k configs on GB200 NVL rack (18 nodes × 4 GPUs)."""
-
-    RACK = GB200NVLRack
-    RECIPES = (
-        list((RECIPES_DIR / "gb200-fp4" / "1k1k").glob("*.yaml"))
-        if (RECIPES_DIR / "gb200-fp4" / "1k1k").exists()
-        else []
-    )
-
-    @pytest.mark.parametrize("recipe_path", RECIPES, ids=lambda p: p.name)
-    def test_gpus_per_node_is_4(self, recipe_path):
-        """All GB200 FP4 1k1k configs use 4 GPUs per node."""
-        with (
-            patch.dict(os.environ, self.RACK.slurm_env(), clear=False),
-            patch("subprocess.run", side_effect=self.RACK.mock_scontrol()),
-        ):
-            config = load_config(str(recipe_path))
-            assert config.resources.gpus_per_node == self.RACK.GPUS_PER_NODE, (
-                f"{recipe_path.name}: expected gpus_per_node={self.RACK.GPUS_PER_NODE}, "
-                f"got {config.resources.gpus_per_node}"
-            )
-
-    @pytest.mark.parametrize("recipe_path", RECIPES, ids=lambda p: p.name)
-    def test_fits_in_rack(self, recipe_path):
-        """Recipe fits within the GB200 NVL rack (18 nodes)."""
-        with (
-            patch.dict(os.environ, self.RACK.slurm_env(), clear=False),
-            patch("subprocess.run", side_effect=self.RACK.mock_scontrol()),
-        ):
-            config = load_config(str(recipe_path))
-            r = config.resources
-            total_nodes_needed = (r.prefill_nodes or 0) + (r.decode_nodes or 0) + (r.agg_nodes or 0)
-            assert (
-                total_nodes_needed <= self.RACK.NUM_NODES
-            ), f"{recipe_path.name}: needs {total_nodes_needed} nodes, rack has {self.RACK.NUM_NODES}"
-
-    @pytest.mark.parametrize("recipe_path", RECIPES, ids=lambda p: p.name)
-    def test_endpoint_allocation(self, recipe_path):
-        """Endpoints are allocated correctly on GB200 NVL rack."""
-        with (
-            patch.dict(os.environ, self.RACK.slurm_env(), clear=False),
-            patch("subprocess.run", side_effect=self.RACK.mock_scontrol()),
-        ):
-            config = load_config(str(recipe_path))
-            r = config.resources
-
-            endpoints = config.backend.allocate_endpoints(
-                num_prefill=r.num_prefill,
-                num_decode=r.num_decode,
-                num_agg=r.num_agg,
-                gpus_per_prefill=r.gpus_per_prefill,
-                gpus_per_decode=r.gpus_per_decode,
-                gpus_per_agg=r.gpus_per_agg,
-                gpus_per_node=r.gpus_per_node,
-                available_nodes=self.RACK.nodes(),
-            )
-
-            prefill_eps = [e for e in endpoints if e.mode == "prefill"]
-            decode_eps = [e for e in endpoints if e.mode == "decode"]
-
-            assert len(prefill_eps) == r.num_prefill
-            assert len(decode_eps) == r.num_decode
-
-            for ep in prefill_eps:
-                assert (
-                    ep.total_gpus == r.gpus_per_prefill
-                ), f"prefill endpoint {ep.index} has {ep.total_gpus} GPUs, expected {r.gpus_per_prefill}"
-
-            for ep in decode_eps:
-                assert (
-                    ep.total_gpus == r.gpus_per_decode
-                ), f"decode endpoint {ep.index} has {ep.total_gpus} GPUs, expected {r.gpus_per_decode}"
-
-
-class TestH100Cluster:
-    """H100 configs on H100 rack (13 nodes × 8 GPUs = 104 total)."""
+class TestMockerExample:
+    """The mocker example on an 8-GPU rack."""
 
     RACK = H100Rack
-    RECIPES = list((RECIPES_DIR / "h100").glob("*.yaml")) if (RECIPES_DIR / "h100").exists() else []
+    EXAMPLES = (MOCKER_EXAMPLE,)
 
-    @pytest.mark.parametrize("recipe_path", RECIPES, ids=lambda p: p.name)
-    def test_gpus_per_node_is_8(self, recipe_path):
-        """All H100 configs use 8 GPUs per node."""
+    @pytest.mark.parametrize("example_path", EXAMPLES, ids=lambda p: p.name)
+    def test_gpus_per_node_is_8(self, example_path):
+        """The mocker example uses eight GPUs per node like the rest of the matrix."""
         with (
             patch.dict(os.environ, self.RACK.slurm_env(), clear=False),
             patch("subprocess.run", side_effect=self.RACK.mock_scontrol()),
         ):
-            config = load_config(str(recipe_path))
+            config = load_config(str(example_path))
             assert config.resources.gpus_per_node == self.RACK.GPUS_PER_NODE, (
-                f"{recipe_path.name}: expected gpus_per_node={self.RACK.GPUS_PER_NODE}, "
+                f"{example_path.name}: expected gpus_per_node={self.RACK.GPUS_PER_NODE}, "
                 f"got {config.resources.gpus_per_node}"
             )
 
-    @pytest.mark.parametrize("recipe_path", RECIPES, ids=lambda p: p.name)
-    def test_endpoint_allocation(self, recipe_path):
-        """Endpoints are allocated correctly on H100 rack."""
+    @pytest.mark.parametrize("example_path", EXAMPLES, ids=lambda p: p.name)
+    def test_fits_in_rack(self, example_path):
+        """Example fits within the rack."""
         with (
             patch.dict(os.environ, self.RACK.slurm_env(), clear=False),
             patch("subprocess.run", side_effect=self.RACK.mock_scontrol()),
         ):
-            config = load_config(str(recipe_path))
-            r = config.resources
+            config = load_config(str(example_path))
+            r = config.topology
+            total_nodes_needed = (r.prefill_nodes or 0) + (r.decode_nodes or 0) + (r.agg_nodes or 0)
+            assert total_nodes_needed <= self.RACK.NUM_NODES, (
+                f"{example_path.name}: needs {total_nodes_needed} nodes, rack has {self.RACK.NUM_NODES}"
+            )
+
+    @pytest.mark.parametrize("example_path", EXAMPLES, ids=lambda p: p.name)
+    def test_endpoint_allocation(self, example_path):
+        """Endpoints are allocated correctly for the mocker example."""
+        with (
+            patch.dict(os.environ, self.RACK.slurm_env(), clear=False),
+            patch("subprocess.run", side_effect=self.RACK.mock_scontrol()),
+        ):
+            config = load_config(str(example_path))
+            r = config.topology
 
             endpoints = config.backend.allocate_endpoints(
                 num_prefill=r.num_prefill,
@@ -270,43 +225,79 @@ class TestH100Cluster:
 
             prefill_eps = [e for e in endpoints if e.mode == "prefill"]
             decode_eps = [e for e in endpoints if e.mode == "decode"]
+            agg_eps = [e for e in endpoints if e.mode == "agg"]
 
             assert len(prefill_eps) == r.num_prefill
             assert len(decode_eps) == r.num_decode
+            assert len(agg_eps) == r.num_agg
+
+            for ep in prefill_eps:
+                assert ep.total_gpus == r.gpus_per_prefill, (
+                    f"prefill endpoint {ep.index} has {ep.total_gpus} GPUs, expected {r.gpus_per_prefill}"
+                )
+
+            for ep in decode_eps:
+                assert ep.total_gpus == r.gpus_per_decode, (
+                    f"decode endpoint {ep.index} has {ep.total_gpus} GPUs, expected {r.gpus_per_decode}"
+                )
+            for ep in agg_eps:
+                assert ep.total_gpus == r.gpus_per_agg
+
+
+class TestH100Examples:
+    """Every topology example on an H100 rack (13 nodes × 8 GPUs)."""
+
+    RACK = H100Rack
+    EXAMPLES = TOPOLOGY_EXAMPLES
+
+    @pytest.mark.parametrize("example_path", EXAMPLES, ids=lambda p: p.name)
+    def test_gpus_per_node_is_8(self, example_path):
+        """All curated H100 examples use eight GPUs per node."""
+        with (
+            patch.dict(os.environ, self.RACK.slurm_env(), clear=False),
+            patch("subprocess.run", side_effect=self.RACK.mock_scontrol()),
+        ):
+            config = load_config(str(example_path))
+            assert config.resources.gpus_per_node == self.RACK.GPUS_PER_NODE, (
+                f"{example_path.name}: expected gpus_per_node={self.RACK.GPUS_PER_NODE}, "
+                f"got {config.resources.gpus_per_node}"
+            )
+
+    @pytest.mark.parametrize("example_path", EXAMPLES, ids=lambda p: p.name)
+    def test_endpoint_allocation(self, example_path):
+        """Endpoints are allocated correctly for each curated H100 example."""
+        with (
+            patch.dict(os.environ, self.RACK.slurm_env(), clear=False),
+            patch("subprocess.run", side_effect=self.RACK.mock_scontrol()),
+        ):
+            config = load_config(str(example_path))
+            r = config.topology
+
+            endpoints = config.backend.allocate_endpoints(
+                num_prefill=r.num_prefill,
+                num_decode=r.num_decode,
+                num_agg=r.num_agg,
+                gpus_per_prefill=r.gpus_per_prefill,
+                gpus_per_decode=r.gpus_per_decode,
+                gpus_per_agg=r.gpus_per_agg,
+                gpus_per_node=r.gpus_per_node,
+                available_nodes=self.RACK.nodes(),
+            )
+
+            prefill_eps = [e for e in endpoints if e.mode == "prefill"]
+            decode_eps = [e for e in endpoints if e.mode == "decode"]
+            agg_eps = [e for e in endpoints if e.mode == "agg"]
+
+            assert len(prefill_eps) == r.num_prefill
+            assert len(decode_eps) == r.num_decode
+            assert len(agg_eps) == r.num_agg
 
             for ep in prefill_eps:
                 assert ep.total_gpus == r.gpus_per_prefill
             for ep in decode_eps:
                 assert ep.total_gpus == r.gpus_per_decode
-
-    @pytest.mark.parametrize("recipe_path", RECIPES, ids=lambda p: p.name)
-    def test_multi_node_tp(self, recipe_path):
-        """H100 configs with TP > 8 span multiple nodes correctly."""
-        with (
-            patch.dict(os.environ, self.RACK.slurm_env(), clear=False),
-            patch("subprocess.run", side_effect=self.RACK.mock_scontrol()),
-        ):
-            config = load_config(str(recipe_path))
-            r = config.resources
-
-            if r.gpus_per_prefill > self.RACK.GPUS_PER_NODE:
-                expected_nodes = r.gpus_per_prefill // self.RACK.GPUS_PER_NODE
-
-                endpoints = config.backend.allocate_endpoints(
-                    num_prefill=r.num_prefill,
-                    num_decode=r.num_decode,
-                    num_agg=r.num_agg,
-                    gpus_per_prefill=r.gpus_per_prefill,
-                    gpus_per_decode=r.gpus_per_decode,
-                    gpus_per_agg=r.gpus_per_agg,
-                    gpus_per_node=r.gpus_per_node,
-                    available_nodes=self.RACK.nodes(),
-                )
-
-                for ep in [e for e in endpoints if e.mode == "prefill"]:
-                    assert (
-                        ep.num_nodes == expected_nodes
-                    ), f"prefill endpoint should span {expected_nodes} nodes, got {ep.num_nodes}"
+            for ep in agg_eps:
+                assert ep.total_gpus == r.gpus_per_agg
 
 
 class TestCIConfigs:
@@ -325,7 +316,7 @@ class TestCIConfigs:
             patch("subprocess.run", side_effect=self.RACK.mock_scontrol()),
         ):
             config = load_config(str(recipe_path))
-            r = config.resources
+            r = config.topology
 
             endpoints = config.backend.allocate_endpoints(
                 num_prefill=r.num_prefill,
@@ -354,7 +345,7 @@ class TestCIConfigs:
             patch("subprocess.run", side_effect=self.RACK.mock_scontrol()),
         ):
             config = load_config(str(recipe_path))
-            r = config.resources
+            r = config.topology
 
             endpoints = config.backend.allocate_endpoints(
                 num_prefill=r.num_prefill,
@@ -379,43 +370,40 @@ class TestCIConfigs:
                 assert ep.total_gpus == r.gpus_per_decode
 
 
-class TestQwen32BCluster:
-    """Qwen3-32B configs with shared node allocation (decode_nodes=0)."""
+class TestSharedNodeDisaggExample:
+    """Disaggregated examples share one node between prefill and decode (decode_nodes=0)."""
 
     RACK = H100Rack
-    RECIPES = list((RECIPES_DIR / "qwen3-32b").glob("*.yaml")) if (RECIPES_DIR / "qwen3-32b").exists() else []
+    EXAMPLES = TestH100Examples.EXAMPLES
 
-    @pytest.mark.parametrize("recipe_path", RECIPES, ids=lambda p: p.name)
-    def test_config_loads(self, recipe_path):
-        """Qwen3-32B configs load correctly."""
+    @pytest.mark.parametrize("example_path", EXAMPLES, ids=lambda p: p.name)
+    def test_config_loads(self, example_path):
+        """Topology examples load correctly."""
         with (
             patch.dict(os.environ, self.RACK.slurm_env(), clear=False),
             patch("subprocess.run", side_effect=self.RACK.mock_scontrol()),
         ):
-            config = load_config(str(recipe_path))
+            config = load_config(str(example_path))
             assert config.name is not None
             assert config.resources.gpus_per_node == 8
 
-    def test_disagg_kv_router_shared_node_allocation(self):
-        """disagg-kv-sglang.yaml: 6P+2D on 2 nodes with decode_nodes=0."""
-        recipe_path = RECIPES_DIR / "qwen3-32b" / "disagg-kv-sglang.yaml"
-        if not recipe_path.exists():
-            pytest.skip("disagg-kv-sglang.yaml not found")
+    DISAGG_EXAMPLES = tuple(path for path in TOPOLOGY_EXAMPLES if path.name.endswith("-disagg.yaml"))
 
+    @pytest.mark.parametrize("example_path", DISAGG_EXAMPLES, ids=lambda p: f"{p.parent.name}/{p.name}")
+    def test_disagg_shared_node_allocation(self, example_path):
+        """1P+1D TP1 on one node with decode_nodes=0: decode lands on the prefill node's spare GPUs."""
         with (
             patch.dict(os.environ, self.RACK.slurm_env(), clear=False),
             patch("subprocess.run", side_effect=self.RACK.mock_scontrol()),
         ):
-            config = load_config(str(recipe_path))
-            r = config.resources
+            config = load_config(str(example_path))
+            r = config.topology
 
-            # Verify decode_nodes=0 triggers inheritance from prefill
-            assert r.decode_nodes == 0, "decode_nodes should be 0"
-            assert r.gpus_per_prefill == 2, "prefill TP should be 2"
-            assert r.gpus_per_decode == 2, "decode TP should inherit 2 from prefill"
+            assert r.decode_nodes == 0, "decode_nodes should be 0 (shared node)"
+            assert r.gpus_per_prefill == 1
+            assert r.gpus_per_decode == 1
 
-            # Allocate endpoints
-            nodes = self.RACK.nodes()[:2]
+            nodes = self.RACK.nodes()[:1]
             endpoints = allocate_endpoints(
                 num_prefill=r.num_prefill,
                 num_decode=r.num_decode,
@@ -429,48 +417,26 @@ class TestQwen32BCluster:
 
             prefill_eps = [e for e in endpoints if e.mode == "prefill"]
             decode_eps = [e for e in endpoints if e.mode == "decode"]
+            assert len(prefill_eps) == 1
+            assert len(decode_eps) == 1
+            assert prefill_eps[0].nodes[0] == nodes[0]
+            assert decode_eps[0].nodes[0] == nodes[0], "decode should share the prefill node"
 
-            assert len(prefill_eps) == 6
-            assert len(decode_eps) == 2
+            prefill_gpus = set(prefill_eps[0].gpu_indices)
+            decode_gpus = set(decode_eps[0].gpu_indices)
+            assert prefill_gpus.isdisjoint(decode_gpus), f"GPU overlap: prefill {prefill_gpus}, decode {decode_gpus}"
 
-            # Check prefill allocation: first 4 on node0, next 2 on node1
-            for i, ep in enumerate(prefill_eps[:4]):
-                assert ep.nodes[0] == nodes[0], f"prefill {i} should be on node0"
-            for i, ep in enumerate(prefill_eps[4:]):
-                assert ep.nodes[0] == nodes[1], f"prefill {i + 4} should be on node1"
-
-            # Check decode allocation: on node1 (GPUs 4-5, 6-7)
-            for ep in decode_eps:
-                assert ep.nodes[0] == nodes[1], "decode should be on node1"
-
-            # Verify GPU indices don't overlap on shared node (node1)
-            node1_prefill_gpus = set()
-            for ep in prefill_eps:
-                if ep.nodes[0] == nodes[1]:
-                    node1_prefill_gpus.update(ep.gpu_indices)
-
-            node1_decode_gpus = set()
-            for ep in decode_eps:
-                node1_decode_gpus.update(ep.gpu_indices)
-
-            assert node1_prefill_gpus.isdisjoint(
-                node1_decode_gpus
-            ), f"GPU overlap on node1! prefill uses {node1_prefill_gpus}, decode uses {node1_decode_gpus}"
-
-    def test_disagg_kv_router_cuda_visible_devices(self):
-        """Processes on shared node have non-overlapping CUDA_VISIBLE_DEVICES."""
-        recipe_path = RECIPES_DIR / "qwen3-32b" / "disagg-kv-sglang.yaml"
-        if not recipe_path.exists():
-            pytest.skip("disagg-kv-sglang.yaml not found")
-
+    @pytest.mark.parametrize("example_path", DISAGG_EXAMPLES, ids=lambda p: f"{p.parent.name}/{p.name}")
+    def test_disagg_cuda_visible_devices(self, example_path):
+        """Processes on the shared node have non-overlapping CUDA_VISIBLE_DEVICES."""
         with (
             patch.dict(os.environ, self.RACK.slurm_env(), clear=False),
             patch("subprocess.run", side_effect=self.RACK.mock_scontrol()),
         ):
-            config = load_config(str(recipe_path))
-            r = config.resources
+            config = load_config(str(example_path))
+            r = config.topology
 
-            nodes = self.RACK.nodes()[:2]
+            nodes = self.RACK.nodes()[:1]
             endpoints = allocate_endpoints(
                 num_prefill=r.num_prefill,
                 num_decode=r.num_decode,
@@ -481,53 +447,30 @@ class TestQwen32BCluster:
                 gpus_per_node=r.gpus_per_node,
                 available_nodes=nodes,
             )
-
             processes = endpoints_to_processes(endpoints)
+            node0_processes = [p for p in processes if p.node == nodes[0]]
 
-            # Group processes by node
-            node1_processes = [p for p in processes if p.node == nodes[1]]
+            assert len(node0_processes) == 2, f"Expected 1 prefill + 1 decode process, got {len(node0_processes)}"
 
-            # Should have 2 prefill + 2 decode = 4 processes on node1
-            assert len(node1_processes) == 4, f"Expected 4 processes on node1, got {len(node1_processes)}"
-
-            # Each process should have unique, non-overlapping GPU indices
-            all_gpus_on_node1 = set()
-            for proc in node1_processes:
+            seen: set[int] = set()
+            for proc in node0_processes:
                 for gpu in proc.gpu_indices:
-                    assert gpu not in all_gpus_on_node1, f"GPU {gpu} assigned to multiple processes on {nodes[1]}!"
-                    all_gpus_on_node1.add(gpu)
+                    assert gpu not in seen, f"GPU {gpu} assigned to multiple processes on {nodes[0]}"
+                    seen.add(gpu)
+                expected_cvd = ",".join(str(g) for g in sorted(proc.gpu_indices))
+                assert proc.cuda_visible_devices == expected_cvd
+            assert seen == {0, 1}, f"Expected GPUs 0 and 1 in use, got {seen}"
 
-            # All 8 GPUs on node1 should be used
-            assert all_gpus_on_node1 == {
-                0,
-                1,
-                2,
-                3,
-                4,
-                5,
-                6,
-                7,
-            }, f"Expected all 8 GPUs used on node1, got {all_gpus_on_node1}"
-
-            # Verify CUDA_VISIBLE_DEVICES strings are correct
-            for proc in node1_processes:
-                cvd = proc.cuda_visible_devices
-                expected_gpus = sorted(proc.gpu_indices)
-                expected_cvd = ",".join(str(g) for g in expected_gpus)
-                assert cvd == expected_cvd, f"Expected CUDA_VISIBLE_DEVICES={expected_cvd}, got {cvd}"
-
-    def test_disagg_kv_router_total_allocation_fits(self):
+    @pytest.mark.parametrize("example_path", DISAGG_EXAMPLES, ids=lambda p: f"{p.parent.name}/{p.name}")
+    def test_disagg_total_allocation_fits(self, example_path):
         """Total GPU allocation fits within declared nodes."""
-        recipe_path = RECIPES_DIR / "qwen3-32b" / "disagg-kv-sglang.yaml"
-        if not recipe_path.exists():
-            pytest.skip("disagg-kv-sglang.yaml not found")
 
         with (
             patch.dict(os.environ, self.RACK.slurm_env(), clear=False),
             patch("subprocess.run", side_effect=self.RACK.mock_scontrol()),
         ):
-            config = load_config(str(recipe_path))
-            r = config.resources
+            config = load_config(str(example_path))
+            r = config.topology
 
             total_gpus_needed = r.num_prefill * r.gpus_per_prefill + r.num_decode * r.gpus_per_decode
             total_gpus_available = r.total_nodes * r.gpus_per_node
@@ -539,25 +482,21 @@ class TestQwen32BCluster:
 
 
 class TestMooncakeKVStore:
-    """Tests for mooncake_kv_store configuration on SGLangProtocol."""
+    """Tests for mooncake_kv_store configuration on SGLangBackend."""
 
     def test_mooncake_worker_env_not_set(self):
         """No mooncake_kv_store → get_mooncake_worker_env returns empty dict."""
-        from srtctl.backends.sglang import SGLangProtocol
+        from srtctl.backends.sglang import SGLangBackend
 
-        backend = SGLangProtocol()
+        backend = SGLangBackend()
         assert backend.get_mooncake_worker_env("10.0.0.1", "10.0.0.2") == {}
 
     def test_mooncake_worker_env_minimal(self):
         """mooncake_kv_store with no env → MOONCAKE_MASTER + metadata URL + auto-resolved hostname."""
-        from srtctl.backends.sglang import (
-            MOONCAKE_HTTP_METADATA_PORT,
-            MOONCAKE_MASTER_PORT,
-            MooncakeKVStoreConfig,
-            SGLangProtocol,
-        )
+        from srtctl.backends.sglang import MooncakeKVStoreConfig, SGLangBackend
+        from srtctl.ports import MOONCAKE_HTTP_METADATA_PORT, MOONCAKE_MASTER_PORT
 
-        backend = SGLangProtocol(mooncake_kv_store=MooncakeKVStoreConfig())
+        backend = SGLangBackend(mooncake_kv_store=MooncakeKVStoreConfig())
         env = backend.get_mooncake_worker_env("10.0.0.1", "10.0.0.42")
         assert env == {
             "MOONCAKE_MASTER": f"10.0.0.1:{MOONCAKE_MASTER_PORT}",
@@ -567,14 +506,10 @@ class TestMooncakeKVStore:
 
     def test_mooncake_worker_env_master_always_overrides_user(self):
         """User-supplied MOONCAKE_MASTER and metadata URL are always overridden by srtslurm."""
-        from srtctl.backends.sglang import (
-            MOONCAKE_HTTP_METADATA_PORT,
-            MOONCAKE_MASTER_PORT,
-            MooncakeKVStoreConfig,
-            SGLangProtocol,
-        )
+        from srtctl.backends.sglang import MooncakeKVStoreConfig, SGLangBackend
+        from srtctl.ports import MOONCAKE_HTTP_METADATA_PORT, MOONCAKE_MASTER_PORT
 
-        backend = SGLangProtocol(
+        backend = SGLangBackend(
             mooncake_kv_store=MooncakeKVStoreConfig(
                 env={
                     "MOONCAKE_MASTER": "should-be-ignored:9999",
@@ -588,9 +523,9 @@ class TestMooncakeKVStore:
 
     def test_mooncake_worker_env_local_hostname_user_can_override(self):
         """User-supplied MOONCAKE_LOCAL_HOSTNAME in env overrides the auto-resolved value."""
-        from srtctl.backends.sglang import MooncakeKVStoreConfig, SGLangProtocol
+        from srtctl.backends.sglang import MooncakeKVStoreConfig, SGLangBackend
 
-        backend = SGLangProtocol(
+        backend = SGLangBackend(
             mooncake_kv_store=MooncakeKVStoreConfig(env={"MOONCAKE_LOCAL_HOSTNAME": "custom-rdma-nic"})
         )
         env = backend.get_mooncake_worker_env("10.0.0.1", "10.0.0.42")
@@ -598,9 +533,10 @@ class TestMooncakeKVStore:
 
     def test_mooncake_worker_env_passthrough(self):
         """mooncake_kv_store.env values are merged with MOONCAKE_MASTER."""
-        from srtctl.backends.sglang import MOONCAKE_MASTER_PORT, MooncakeKVStoreConfig, SGLangProtocol
+        from srtctl.backends.sglang import MooncakeKVStoreConfig, SGLangBackend
+        from srtctl.ports import MOONCAKE_MASTER_PORT
 
-        backend = SGLangProtocol(
+        backend = SGLangBackend(
             mooncake_kv_store=MooncakeKVStoreConfig(
                 env={
                     "MOONCAKE_PROTOCOL": "rdma",
@@ -629,18 +565,20 @@ model:
   container: nvcr.io/test:latest
   precision: bf16
 resources:
-  agg_nodes: 1
-  agg_workers: 1
   gpu_type: h100
-backend:
+engine:
   type: sglang
   mooncake_kv_store:
     container: nvcr.io/nvidia/mooncake:latest
     master_extra_args:
-      - --nof_eviction_high_watermark_ratio=0.9
+    - --nof_eviction_high_watermark_ratio=0.9
     env:
       MOONCAKE_PROTOCOL: rdma
-      MOONCAKE_GLOBAL_SEGMENT_SIZE: "4gb"
+      MOONCAKE_GLOBAL_SEGMENT_SIZE: 4gb
+roles:
+  agg:
+    nodes: 1
+    workers: 1
 """)
         config = SrtConfig.Schema().load(raw)
         assert config.backend.mooncake_kv_store is not None
@@ -665,21 +603,24 @@ model:
   container: nvcr.io/test:latest
   precision: bf16
 resources:
-  prefill_nodes: 1
-  decode_nodes: 1
-  prefill_workers: 1
-  decode_workers: 1
   gpu_type: h100
-backend:
+engine:
   type: sglang
   mooncake_kv_store:
     env:
       MOONCAKE_PROTOCOL: rdma
+roles:
+  prefill:
+    nodes: 1
+    workers: 1
+  decode:
+    nodes: 1
+    workers: 1
 """)
         try:
             SrtConfig.Schema().load(raw)
         except ValidationError as e:
-            assert "mooncake_kv_store" in str(e)
+            assert "mooncake-master service" in str(e)
             assert "disaggregation-transfer-backend" in str(e)
         else:
             raise AssertionError("expected ValidationError")
@@ -697,20 +638,22 @@ model:
   container: nvcr.io/test:latest
   precision: bf16
 resources:
-  prefill_nodes: 1
-  decode_nodes: 1
-  prefill_workers: 1
-  decode_workers: 1
   gpu_type: h100
-backend:
+engine:
   type: sglang
   mooncake_kv_store:
     env:
       MOONCAKE_PROTOCOL: rdma
-  sglang_config:
-    prefill:
+roles:
+  prefill:
+    nodes: 1
+    workers: 1
+    args:
       disaggregation-transfer-backend: mooncake
-    decode:
+  decode:
+    nodes: 1
+    workers: 1
+    args:
       disaggregation-transfer-backend: mooncake
 """)
         config = SrtConfig.Schema().load(raw)
@@ -729,18 +672,20 @@ model:
   container: nvcr.io/test:latest
   precision: bf16
 resources:
-  prefill_nodes: 1
-  decode_nodes: 1
-  prefill_workers: 1
-  decode_workers: 1
   gpu_type: h100
-backend:
+engine:
   type: sglang
   mooncake_kv_store: {}
-  sglang_config:
-    prefill:
+roles:
+  prefill:
+    nodes: 1
+    workers: 1
+    args:
       disaggregation_transfer_backend: mooncake
-    decode:
+  decode:
+    nodes: 1
+    workers: 1
+    args:
       disaggregation_transfer_backend: mooncake
 """)
         # Should not raise.
@@ -759,14 +704,16 @@ model:
   container: nvcr.io/test:latest
   precision: bf16
 resources:
-  agg_nodes: 1
-  agg_workers: 1
   gpu_type: h100
-backend:
+engine:
   type: sglang
   mooncake_kv_store:
     env:
       MOONCAKE_PROTOCOL: rdma
+roles:
+  agg:
+    nodes: 1
+    workers: 1
 """)
         config = SrtConfig.Schema().load(raw)
         assert config.backend.mooncake_kv_store is not None
@@ -779,17 +726,17 @@ class TestVLLMMooncakeKVStore:
 
     def test_vllm_mooncake_worker_env_not_set(self):
         """No mooncake_kv_store → get_mooncake_worker_env returns empty dict."""
-        from srtctl.backends.vllm import VLLMProtocol
+        from srtctl.backends.vllm import VLLMBackend
 
-        backend = VLLMProtocol()
+        backend = VLLMBackend()
         assert backend.get_mooncake_worker_env("10.0.0.1", "10.0.0.2") == {}
 
     def test_vllm_mooncake_worker_env_uses_shared_ports(self):
         """vLLM reuses the shared mooncake_master port pair from srtctl.ports."""
-        from srtctl.backends.vllm import VLLMMooncakeKVStoreConfig, VLLMProtocol
+        from srtctl.backends.vllm import VLLMMooncakeKVStoreConfig, VLLMBackend
         from srtctl.ports import MOONCAKE_HTTP_METADATA_PORT, MOONCAKE_MASTER_PORT
 
-        backend = VLLMProtocol(mooncake_kv_store=VLLMMooncakeKVStoreConfig())
+        backend = VLLMBackend(mooncake_kv_store=VLLMMooncakeKVStoreConfig())
         env = backend.get_mooncake_worker_env("10.0.0.1", "10.0.0.42")
         assert env == {
             "MOONCAKE_MASTER": f"10.0.0.1:{MOONCAKE_MASTER_PORT}",
@@ -800,10 +747,10 @@ class TestVLLMMooncakeKVStore:
 
     def test_vllm_mooncake_master_overrides_user_env(self):
         """User-supplied MOONCAKE_MASTER is always overridden by srtslurm."""
-        from srtctl.backends.vllm import VLLMMooncakeKVStoreConfig, VLLMProtocol
+        from srtctl.backends.vllm import VLLMMooncakeKVStoreConfig, VLLMBackend
         from srtctl.ports import MOONCAKE_MASTER_PORT
 
-        backend = VLLMProtocol(
+        backend = VLLMBackend(
             mooncake_kv_store=VLLMMooncakeKVStoreConfig(
                 env={"MOONCAKE_MASTER": "should-be-ignored:9999"}
             )
@@ -813,9 +760,9 @@ class TestVLLMMooncakeKVStore:
 
     def test_vllm_mooncake_local_hostname_user_can_override(self):
         """User MOONCAKE_LOCAL_HOSTNAME overrides the auto-resolved value."""
-        from srtctl.backends.vllm import VLLMMooncakeKVStoreConfig, VLLMProtocol
+        from srtctl.backends.vllm import VLLMMooncakeKVStoreConfig, VLLMBackend
 
-        backend = VLLMProtocol(
+        backend = VLLMBackend(
             mooncake_kv_store=VLLMMooncakeKVStoreConfig(
                 env={"MOONCAKE_LOCAL_HOSTNAME": "rdma-nic-ip"}
             )
@@ -836,23 +783,25 @@ model:
   container: nvcr.io/test:latest
   precision: bf16
 resources:
-  prefill_nodes: 1
-  decode_nodes: 1
-  prefill_workers: 1
-  decode_workers: 1
   gpu_type: gb200
-backend:
+engine:
   type: vllm
   mooncake_kv_store:
     container: inferactinc/public:mk-int-20260507
     master_extra_args:
-      - --nof_eviction_high_watermark_ratio=0.9
+    - --nof_eviction_high_watermark_ratio=0.9
     env:
       MOONCAKE_PROTOCOL: rdma
-  vllm_config:
-    prefill:
+roles:
+  prefill:
+    nodes: 1
+    workers: 1
+    args:
       kv-transfer-config: '{"kv_connector":"MooncakeConnector","kv_role":"kv_both"}'
-    decode:
+  decode:
+    nodes: 1
+    workers: 1
+    args:
       kv-transfer-config: '{"kv_connector":"MooncakeConnector","kv_role":"kv_both"}'
 """)
         config = SrtConfig.Schema().load(raw)
@@ -878,16 +827,19 @@ model:
   container: nvcr.io/test:latest
   precision: bf16
 resources:
-  prefill_nodes: 1
-  decode_nodes: 1
-  prefill_workers: 1
-  decode_workers: 1
   gpu_type: gb200
-backend:
+engine:
   type: vllm
   mooncake_kv_store:
     env:
       MOONCAKE_PROTOCOL: rdma
+roles:
+  prefill:
+    nodes: 1
+    workers: 1
+  decode:
+    nodes: 1
+    workers: 1
 """)
         with pytest.raises(ValidationError, match="Mooncake connector"):
             SrtConfig.Schema().load(raw)
@@ -923,24 +875,26 @@ model:
   container: nvcr.io/test:latest
   precision: bf16
 resources:
-  prefill_nodes: 1
-  decode_nodes: 1
-  prefill_workers: 1
-  decode_workers: 1
   gpu_type: gb200
-backend:
+engine:
   type: vllm
   mooncake_kv_store:
     env:
       MOONCAKE_PROTOCOL: rdma
-  vllm_config:
-    prefill:
+roles:
+  prefill:
+    nodes: 1
+    workers: 1
+    args:
       kv-transfer-config: '{kv_transfer_cfg}'
-    decode:
+  decode:
+    nodes: 1
+    workers: 1
+    args:
       kv-transfer-config: '{kv_transfer_cfg}'
 """)
         config = SrtConfig.Schema().load(raw)
-        assert "MooncakeStoreConnector" in config.backend.vllm_config.prefill["kv-transfer-config"]
+        assert "MooncakeStoreConnector" in config.backend.get_config_for_mode("prefill")["kv-transfer-config"]
 
     def test_vllm_mooncake_disagg_with_kv_transfer_config_passes(self):
         """vLLM disagg + mooncake_kv_store with MooncakeConnector kv-transfer-config validates clean."""
@@ -955,31 +909,33 @@ model:
   container: nvcr.io/test:latest
   precision: bf16
 resources:
-  prefill_nodes: 1
-  decode_nodes: 1
-  prefill_workers: 1
-  decode_workers: 1
   gpu_type: gb200
-backend:
+engine:
   type: vllm
   mooncake_kv_store:
     env:
       MOONCAKE_PROTOCOL: rdma
-  vllm_config:
-    prefill:
+roles:
+  prefill:
+    nodes: 1
+    workers: 1
+    args:
       kv-transfer-config: '{"kv_connector":"MooncakeConnector","kv_role":"kv_both"}'
-    decode:
+  decode:
+    nodes: 1
+    workers: 1
+    args:
       kv-transfer-config: '{"kv_connector":"MooncakeConnector","kv_role":"kv_both"}'
 """)
         config = SrtConfig.Schema().load(raw)
-        assert config.backend.vllm_config.prefill["kv-transfer-config"]
+        assert config.backend.get_config_for_mode("prefill")["kv-transfer-config"]
 
     def test_vllm_mooncake_store_config_unset_yields_only_master_address(self):
         """No store_config from user → JSON only contains the auto-injected master_server_address."""
-        from srtctl.backends.vllm import VLLMMooncakeKVStoreConfig, VLLMProtocol
+        from srtctl.backends.vllm import VLLMMooncakeKVStoreConfig, VLLMBackend
         from srtctl.ports import MOONCAKE_MASTER_PORT
 
-        backend = VLLMProtocol(mooncake_kv_store=VLLMMooncakeKVStoreConfig())
+        backend = VLLMBackend(mooncake_kv_store=VLLMMooncakeKVStoreConfig())
         cfg = backend.build_mooncake_store_config("10.0.0.1")
         # srtslurm intentionally does not default hardware-specific fields
         # (protocol, device_name, global_segment_size, …) — users must set
@@ -988,10 +944,10 @@ backend:
 
     def test_vllm_mooncake_store_config_user_overrides(self):
         """User store_config values pass through; master_server_address is always auto."""
-        from srtctl.backends.vllm import VLLMMooncakeKVStoreConfig, VLLMProtocol
+        from srtctl.backends.vllm import VLLMMooncakeKVStoreConfig, VLLMBackend
         from srtctl.ports import MOONCAKE_MASTER_PORT
 
-        backend = VLLMProtocol(
+        backend = VLLMBackend(
             mooncake_kv_store=VLLMMooncakeKVStoreConfig(
                 store_config={
                     "metadata_server": "http://my-metadata:9000",
@@ -1014,9 +970,9 @@ backend:
 
     def test_vllm_mooncake_store_config_passes_unknown_keys_through(self):
         """Unknown keys in store_config pass through so new vLLM fields work without code changes."""
-        from srtctl.backends.vllm import VLLMMooncakeKVStoreConfig, VLLMProtocol
+        from srtctl.backends.vllm import VLLMMooncakeKVStoreConfig, VLLMBackend
 
-        backend = VLLMProtocol(
+        backend = VLLMBackend(
             mooncake_kv_store=VLLMMooncakeKVStoreConfig(
                 store_config={"new_upstream_field": "some_value", "another_new_field": 42}
             )
@@ -1030,10 +986,10 @@ backend:
         from srtctl.backends.vllm import (
             MOONCAKE_STORE_CONFIG_CONTAINER_PATH,
             VLLMMooncakeKVStoreConfig,
-            VLLMProtocol,
+            VLLMBackend,
         )
 
-        backend = VLLMProtocol(mooncake_kv_store=VLLMMooncakeKVStoreConfig())
+        backend = VLLMBackend(mooncake_kv_store=VLLMMooncakeKVStoreConfig())
         env = backend.get_mooncake_worker_env("10.0.0.1", "10.0.0.42")
         assert env["MOONCAKE_CONFIG_PATH"] == MOONCAKE_STORE_CONFIG_CONTAINER_PATH
         assert MOONCAKE_STORE_CONFIG_CONTAINER_PATH == "/logs/mooncake_store_config.json"
@@ -1051,26 +1007,28 @@ model:
   container: nvcr.io/test:latest
   precision: bf16
 resources:
-  prefill_nodes: 1
-  decode_nodes: 1
-  prefill_workers: 1
-  decode_workers: 1
   gpu_type: gb200
-backend:
+engine:
   type: vllm
   mooncake_kv_store:
     env:
       MOONCAKE_PROTOCOL: rdma
     store_config:
-      metadata_server: "P2PHANDSHAKE"
-      global_segment_size: "100GB"
-      local_buffer_size: "4GB"
-      protocol: "rdma"
-      device_name: ""
-  vllm_config:
-    prefill:
+      metadata_server: P2PHANDSHAKE
+      global_segment_size: 100GB
+      local_buffer_size: 4GB
+      protocol: rdma
+      device_name: ''
+roles:
+  prefill:
+    nodes: 1
+    workers: 1
+    args:
       kv-transfer-config: '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both"}'
-    decode:
+  decode:
+    nodes: 1
+    workers: 1
+    args:
       kv-transfer-config: '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both"}'
 """)
         config = SrtConfig.Schema().load(raw)
@@ -1084,10 +1042,10 @@ backend:
     def test_mooncake_master_extra_args_are_appended(self):
         """Version-specific master flags are opt-in and appended after defaults."""
         from srtctl.backends.vllm import VLLMMooncakeKVStoreConfig
-        from srtctl.cli.do_sweep import _build_mooncake_master_command
+        from srtctl.services.mooncake_master import mooncake_master_command
 
         nof_arg = "--nof_eviction_high_watermark_ratio=0.9"
-        command = _build_mooncake_master_command(VLLMMooncakeKVStoreConfig(master_extra_args=[nof_arg]))
+        command = mooncake_master_command(VLLMMooncakeKVStoreConfig(master_extra_args=[nof_arg]).master_extra_args)
 
         assert "--eviction_high_watermark_ratio=0.9" in command
         assert command[-1] == nof_arg

@@ -10,10 +10,18 @@ import json
 import math
 import os
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, TypeGuard, cast
 
+from srtctl.core.power.cpu_rails import RAIL_COLUMN_NAMES as CPU_RAIL_COLUMN_NAMES
+
 SCHEMA_VERSION = 1
+# The samples CSV is versioned independently: SCHEMA_VERSION is shared with
+# manifest.json and with measurement-window files whose writer keeps its own copy.
+SAMPLES_SCHEMA_VERSION_V1 = 1
+SAMPLES_SCHEMA_VERSION_V2 = 2
+SAMPLES_SCHEMA_VERSION = 3
 
 PRODUCER = "srt-slurm.dcgm-power"
 POWER_METRIC = "DCGM_FI_DEV_POWER_USAGE"
@@ -21,11 +29,38 @@ POWER_UNIT = "W"
 POWER_SCOPE = "gpu_device_board_as_reported_by_dcgm"
 CLOCK_SOURCE = "head_node_unix_clock"
 
+GPU_UTIL_METRIC = "DCGM_FI_DEV_GPU_UTIL"
+SM_ACTIVE_METRIC = "DCGM_FI_PROF_SM_ACTIVE"
+TEMPERATURE_METRIC = "DCGM_FI_DEV_GPU_TEMP"
+# Physical sanity bound for GPU temperature; exporter blank/error sentinels (DCGM's
+# are near 2**31) fall far outside it.
+MAX_TEMPERATURE_C = 200.0
+
+
+@dataclass(frozen=True)
+class UtilizationMetric:
+    """An optional per-GPU utilization column and the DCGM field that feeds it."""
+
+    column: str
+    metric: str
+    unit: str
+    max_value: float
+
+
+# Load-bearing in two ways: each ``column`` must equal a field name on both
+# ``parser.PowerReading`` and ``samples.SampleRow`` (they are splatted in as
+# keyword arguments), and tuple order defines the trailing SAMPLES_HEADER columns.
+# ``test_utilization_metrics_are_pinned`` fails if either coupling is broken.
+UTILIZATION_METRICS: tuple[UtilizationMetric, ...] = (
+    UtilizationMetric(column="gpu_util_pct", metric=GPU_UTIL_METRIC, unit="percent", max_value=100.0),
+    UtilizationMetric(column="sm_active", metric=SM_ACTIVE_METRIC, unit="fraction", max_value=1.0),
+)
+
 MANIFEST_FILENAME = "manifest.json"
 SAMPLES_FILENAME = "samples.csv"
 WINDOWS_DIRNAME = "windows"
 
-SAMPLES_HEADER = (
+SAMPLES_HEADER_V1 = (
     "schema_version",
     "timestamp_unix",
     "scrape_seq",
@@ -34,8 +69,50 @@ SAMPLES_HEADER = (
     "gpu_uuid",
     "power_w",
 )
+SAMPLES_HEADER_V2 = (*SAMPLES_HEADER_V1, *(metric.column for metric in UTILIZATION_METRICS))
+SAMPLES_HEADER = (*SAMPLES_HEADER_V2, "temperature_c")
+
+CPU_SCHEMA_VERSION_V1 = 1
+# v2 pivots to one row per (timestamp, hostname, socket): power_w is the
+# socket's authoritative figure (ACPI "total" envelope or the DCGM value),
+# with the ACPI component rails as their own columns. v1 wrote one row per
+# rail, which left readers to work out which rows were the same socket.
+CPU_SCHEMA_VERSION = 2
+CPU_SAMPLES_FILENAME = "samples.csv"  # written under <power_dir>/cpu/
+CPU_MANIFEST_FILENAME = "cpu_manifest.json"  # written under <power_dir>/cpu/, non-authoritative
+
+CPU_SAMPLES_HEADER_V1 = (
+    "schema_version",
+    "timestamp_unix",
+    "hostname",
+    "source",
+    "sensor",
+    "socket_id",
+    "power_w",
+    "total_power_w",
+)
+CPU_SAMPLES_HEADER = (
+    "schema_version",
+    "timestamp_unix",
+    "hostname",
+    "source",
+    "sensor",  # the sensor that fed power_w (provenance only)
+    "socket_id",
+    "power_w",  # ACPI: the socket "total" envelope; DCGM: field 1130
+    *CPU_RAIL_COLUMN_NAMES,  # cpu_rail_w, soc_w, dram_w -- ACPI only, blank for DCGM
+    "total_power_w",  # node aggregate: sum of power_w over sockets
+)
+# NOTE: in ACPI mode, power_w / total_power_w carry only "total"-kind channels
+# (e.g. "Grace Power Socket N" or a platform's generic "Total Power socket N"
+# rail). Real hardware traces show the total rail ~93-104W vs cpu_rail+soc
+# ~53-58W for the same socket -- total is a separate, larger measurement of
+# the whole Grace SoC power boundary, not literally cpu_rail + soc. This has
+# not been verified against NVIDIA hardware/DCGM documentation; if it turns
+# out to be wrong, only the ACPI total is affected, since the component-rail
+# columns and DCGM mode (one already-aggregate value per socket) are unaffected.
 
 MAX_SAMPLE_GAP_SECONDS = 3.0
+MAX_MISSING_SAMPLE_WINDOW_FRACTION = 0.05
 COLLECT_CYCLE_TIMEOUT_GRACE_SECONDS = 1.0
 
 BENCHMARK_TYPE_SA_BENCH = "sa-bench"
@@ -87,6 +164,10 @@ class Reason:
     MEASUREMENT_WINDOW_CLOCK_MISMATCH = "measurement_window_clock_mismatch"
     MEASUREMENT_WINDOW_NOT_BRACKETED = "measurement_window_not_bracketed"
     SAMPLE_GAP_EXCEEDED = "sample_gap_exceeded"
+    SAMPLE_LOSS_EXCEEDED = "sample_loss_exceeded"
+    # A node whose clock feeds an artifact could not prove NTP synchronisation
+    # before servers started; sample and window timestamps are not comparable.
+    CLOCK_SYNC_UNVERIFIED = "clock_sync_unverified"
 
 
 ALL_REASON_CODES: frozenset[str] = frozenset(
@@ -126,6 +207,11 @@ def is_safe_relative_subpath(value: str) -> bool:
 def is_finite_number(value: Any) -> TypeGuard[int | float]:
     """Whether ``value`` is a finite real number; bools are not numbers here."""
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def is_valid_temperature_c(value: float) -> bool:
+    """Shared value domain; scrape and CSV readers own their distinct rejection effects."""
+    return math.isfinite(value) and -273.15 <= value <= MAX_TEMPERATURE_C
 
 
 def dedupe(values: list[str]) -> tuple[str, ...]:

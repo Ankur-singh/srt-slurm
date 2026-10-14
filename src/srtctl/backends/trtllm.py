@@ -1,9 +1,11 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 import builtins
+import math
+import re
 import uuid
-from collections.abc import Sequence
-from dataclasses import field
+from collections.abc import Mapping, Sequence
+from dataclasses import field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -11,8 +13,18 @@ import yaml
 from marshmallow import Schema
 from marshmallow_dataclass import dataclass
 
+from srtctl.backends.base import (
+    Backend,
+    BoundRolesField,
+    ProcessGroup,
+    RoleSettings,
+    WorkerMode,
+    role_env,
+    role_for_mode,
+    role_mooncake_store_config,
+)
 from srtctl.backends.sidecar import build_sidecar_launch_command, get_dynamo_sidecar_config, sidecar_grpc_port
-from srtctl.ports import DYN_SYSTEM_PORT_BASE
+from srtctl.ports import DYN_SYSTEM_PORT_BASE, MOONCAKE_MASTER_PORT, TRTLLM_DIST_INIT_PORTS
 
 if TYPE_CHECKING:
     from srtctl.backends.base import SrunConfig
@@ -20,78 +32,256 @@ if TYPE_CHECKING:
     from srtctl.core.schema import DynamoConfig, ProfilingConfig
     from srtctl.core.topology import Endpoint, NodePortAllocator, Process
 
-# Type alias for worker modes
-WorkerMode = Literal["prefill", "decode", "agg"]
+
+# TRT-LLM's Mooncake Store KV connector: the preset name and the module it resolves to.
+# TRT-LLM recognizes the connector by the resolved module (``registry.uses_connector``);
+# the preset fills ``connector_module`` only when the config leaves it unset.
+TRTLLM_MOONCAKE_STORE_CONNECTOR = "mooncake-store"
+TRTLLM_MOONCAKE_STORE_MODULE = "tensorrt_llm._torch.pyexecutor.connectors.mooncake_store"
+
+# A role's ``role`` in its Mooncake client config when the recipe does not set one.
+# Context servers read and write the pool; generation servers only lend their
+# segment, since prompt KV reaches them over the cache transceiver.
+TRTLLM_MOONCAKE_DEFAULT_ROLES: dict[str, str] = {"prefill": "both", "agg": "both", "decode": "capacity"}
+TRTLLM_MOONCAKE_STORE_ROLES = frozenset({"both", "producer", "consumer", "capacity"})
+
+# Client config keys every server of one pool must agree on, so ``roles.<role>.mooncake_store_config``
+# cannot set them: they stay in the ``mooncake-master`` service's ``options.store_config``.
+TRTLLM_MOONCAKE_POOL_KEYS: tuple[str, ...] = (
+    "model_key",
+    "namespace",
+    "metadata_server",
+    "protocol",
+    "master_server_address",
+)
+
+# Keys of the ``kv_connector_config.mooncake_store`` block that the client config does
+# not read; TRT-LLM would drop them silently.
+_TRTLLM_MOONCAKE_BLOCK_ONLY_KEYS: dict[str, str] = {
+    "segment_size": "the client config calls it global_segment_size",
+    "pool": "srtctl points every role at the mooncake-master service",
+    "run_dir": "srtctl hands each role its config through MOONCAKE_CONFIG_PATH",
+    "master_timeout": "srtctl starts the master before the workers",
+}
+
+# TRT-LLM parses sizes in its Mooncake client config with ``parse_size(...,
+# strict_units=True)``: byte counts or binary units only. ``GB``/``MB`` are refused
+# because vLLM's reader of the same file scales them by 1024 and TRT-LLM's by 1000.
+_TRTLLM_MOONCAKE_SIZE_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]*)\s*$")
+_TRTLLM_MOONCAKE_SIZE_UNITS: dict[str, int] = {
+    "": 1,
+    "b": 1,
+    "kib": 1 << 10,
+    "mib": 1 << 20,
+    "gib": 1 << 30,
+    "tib": 1 << 40,
+}
+
+
+def trtllm_mooncake_store_config_filename(mode: WorkerMode) -> str:
+    """The client config file srtslurm writes into log_dir (mounted at /logs) for one worker mode."""
+    return f"mooncake_store_config_{mode}.json"
+
+
+def _trtllm_mooncake_size(key: str, value: Any) -> int | str:
+    """``value`` in bytes as TRT-LLM's ``parse_size(strict_units=True)`` reads it, or why it cannot."""
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        return f"{key} must be a byte count or a size such as '16GiB', got {value!r}"
+    if not isinstance(value, str):
+        if not math.isfinite(value):
+            return f"{key} must be a finite size, got {value!r}"
+        return int(value)
+    match = _TRTLLM_MOONCAKE_SIZE_RE.match(value)
+    scale = _TRTLLM_MOONCAKE_SIZE_UNITS.get(match.group(2).lower()) if match is not None else None
+    if match is None or scale is None:
+        return f"{key} {value!r} must be a byte count or use a binary unit (KiB, MiB, GiB, TiB); 'GB' is refused"
+    return int(float(match.group(1)) * scale)
+
+
+def trtllm_mooncake_block_only_key_problem(keys: Mapping[str, Any]) -> str | None:
+    """Why a key of ``kv_connector_config.mooncake_store`` cannot go in a client config, or None."""
+    for key, why in _TRTLLM_MOONCAKE_BLOCK_ONLY_KEYS.items():
+        if key in keys:
+            hint = " (set global_segment_size)" if key == "segment_size" else "; drop it"
+            return f"{key} belongs to the mooncake_store block and the client config ignores it: {why}{hint}"
+    return None
+
+
+def trtllm_mooncake_role_key_problem(keys: Mapping[str, Any]) -> str | None:
+    """Why a key cannot go in ``roles.<role>.mooncake_store_config``, or None."""
+    pool_wide = [key for key in TRTLLM_MOONCAKE_POOL_KEYS if key in keys]
+    if pool_wide:
+        return (
+            f"{', '.join(pool_wide)} must be the same for every server of the pool; "
+            "set it in the mooncake-master service's options.store_config"
+        )
+    return None
+
+
+def trtllm_mooncake_store_config_problem(payload: Mapping[str, Any]) -> str | None:
+    """Why TRT-LLM would refuse a rendered Mooncake client config, or None.
+
+    Mirrors ``MooncakeStoreConnectorConfig.from_file`` and its ``__post_init__``, which
+    reject these in every rank after the model has loaded, so the recipe fails at load.
+    """
+    model_key = payload.get("model_key")
+    if not isinstance(model_key, str) or not model_key.strip():
+        return (
+            f"model_key must be a non-empty string, got {model_key!r}: TRT-LLM keys the pool by it. "
+            "Leave it unset to use the served model name"
+        )
+    role = payload.get("role")
+    if str(role).strip().lower() not in TRTLLM_MOONCAKE_STORE_ROLES:
+        return f"role must be one of {sorted(TRTLLM_MOONCAKE_STORE_ROLES)}, got {role!r}"
+    if isinstance(payload.get("stage_through_host"), str):
+        # TRT-LLM takes bool() of it, so the string "false" would mean true.
+        return f"stage_through_host must be true or false, not the string {payload['stage_through_host']!r}"
+    for key, minimum in (("global_segment_size", 0), ("local_buffer_size", 1)):
+        if key in payload:
+            size = _trtllm_mooncake_size(key, payload[key])
+            if isinstance(size, str):
+                return size
+            if size < minimum:
+                return f"{key} must be at least {minimum} bytes, got {payload[key]!r}"
+    if "transfer_batch_size" in payload:
+        # TRT-LLM reads it with int(), so "64" and 64.0 are both 64.
+        batch = payload["transfer_batch_size"]
+        try:
+            count = int(batch)
+        except (TypeError, ValueError, OverflowError):
+            count = 0
+        if isinstance(batch, bool) or count <= 0:
+            return f"transfer_batch_size must be a positive integer, got {batch!r}"
+    return None
 
 
 @dataclass(frozen=True)
-class TRTLLMServerConfig:
-    """SGLang server CLI configuration per mode (prefill/decode/aggregated).
+class TRTLLMMooncakeKVStoreConfig:
+    """Mooncake Store pool for TRT-LLM's ``mooncake-store`` KV connector.
 
-    Each mode can have its own configuration dict that gets converted
-    to CLI flags when starting the worker.
+    Filled from a declared ``mooncake-master`` service (``services/normalize.py``).
+    srtslurm launches the upstream ``mooncake_master`` on the infra node, the same
+    master SGLang and vLLM use, and renders one Mooncake client config for every
+    role whose ``kv_connector_config`` resolves to the Mooncake Store connector into
+    ``/logs/mooncake_store_config_<role>.json``. That role's workers get it as
+    ``MOONCAKE_CONFIG_PATH``, which TRT-LLM's connector reads before anything
+    else, so ``trtllm-serve`` and ``dynamo.trtllm`` (which provisions no pool of its
+    own) join the pool the same way, without ``trtllm-serve mooncake_master``.
+
+    Each config is ``{"role": <role default>, "model_key": <served model name>,
+    **store_config, **roles.<role>.mooncake_store_config,
+    "master_server_address": "<infra_ip>:8700"}``. The role default is ``both``
+    for prefill and agg and ``capacity`` for decode.
+
+    Attributes:
+        container: Container image for the master; defaults to the job container.
+        env: Environment injected on every worker, e.g. in-process Mooncake ``MC_*`` knobs.
+        master_extra_args: Extra arguments appended to the ``mooncake_master`` command.
+        store_config: Keys of TRT-LLM's Mooncake client config shared by every role
+            (``protocol``, ``device_name``, ``global_segment_size``, ...); a role
+            overrides the per-server ones in ``roles.<role>.mooncake_store_config``.
     """
 
-    prefill: dict[str, Any] | None = None
-    decode: dict[str, Any] | None = None
-    aggregated: dict[str, Any] | None = None
+    container: str | None = None
+    env: dict[str, str] = field(default_factory=dict)
+    master_extra_args: list[str] = field(default_factory=list)
+    store_config: dict[str, Any] | None = None
 
-    Schema: ClassVar[type[Schema]] = Schema
+    Schema: ClassVar[builtins.type[Schema]] = Schema
+
+
+# Log lines that mean the engine behind a TRT-LLM worker step is gone while the
+# step itself may stay up. ``trtllm-llmapi-launch`` runs the engine as a child of
+# the rank-0 task and prints ``Rank<N> Task exit code: <code>`` when that child
+# exits; the follower ranks block in ``MPICommExecutor`` with no timeout, so
+# neither srun nor the process registry hears about the death otherwise.
+# ``Failed to initialize executor`` is TRT-LLM's own terminal start-up line.
+# Deliberately absent: ``Traceback`` (Dynamo logs a "response stream is closed"
+# traceback for every request the client cancels at EOS) and ``MPI_Abort``
+# (printed on ordinary teardown). A bare-word marker here would fail healthy runs.
+TRTLLM_FATAL_LOG_PATTERNS: tuple[str, ...] = (
+    r"^Rank\d+ Task exit code: (?!0$)\d+$",
+    r"Failed to initialize executor",
+)
+
+# DWDP (TRT-LLM's distributed-weight data-parallel prefill, Kimi-K3 on GB300/R200):
+# ``dwdp_config: {dwdp_size: N, ...}`` in a role's engine args makes N single-GPU
+# ``trtllm-serve`` workers of that role one expert-sharded group. Each worker is
+# its own endpoint here (``gpus: 1``), and before loading weights it joins a
+# TCPStore rendezvous that TRT-LLM reads from the environment: its own
+# ``TRTLLM_DWDP_RANK`` and the group's shared ``TRTLLM_DWDP_MASTER_ADDR`` /
+# ``TRTLLM_DWDP_MASTER_PORT``. The rank is the worker's endpoint index (worker 0
+# is the master), and the worker stage fills in the master's address from the
+# rank-0 endpoint of the same role, since a backend only sees its own process.
+#
+# The N processes also share the model's ``trust_remote_code`` module cache and
+# the CuTe DSL autotuner cache by default, and race on them (a half-written
+# ``transformers_modules`` file or a cache owned by another rank fails the
+# executor init). Each rank therefore gets a private ``HOME`` /
+# ``HF_MODULES_CACHE`` / ``TLLM_AUTOTUNER_CACHE_PATH`` under the job's log dir; a
+# recipe that sets any of those three in the role env keeps its own value.
+DWDP_RANK_ENV = "TRTLLM_DWDP_RANK"
+DWDP_MASTER_ADDR_ENV = "TRTLLM_DWDP_MASTER_ADDR"
+DWDP_MASTER_PORT_ENV = "TRTLLM_DWDP_MASTER_PORT"
+DWDP_RENDEZVOUS_TIMEOUT_ENV = "TRTLLM_DWDP_RENDEZVOUS_TIMEOUT_S"
+DWDP_MASTER_PORT = 29600
+DWDP_RENDEZVOUS_TIMEOUT_S = 3600
+# Container path of the job's log dir (what build_worker_command writes the engine YAML under).
+_CONTAINER_LOG_DIR = "/logs"
 
 
 @dataclass(frozen=True)
-class TRTLLMProtocol:
-    """TRTLLM protocol - implements BackendProtocol.
+class TRTLLMBackend(Backend):
+    """TRTLLM backend configuration and launch implementation.
 
     This frozen dataclass both holds configuration AND implements the
-    BackendProtocol methods for process allocation and launching.
+    Backend methods for process allocation and launching.
 
     Example YAML:
-        backend:
-          type: trtllm
-          prefill_environment:
-            CUDA_LAUNCH_BLOCKING: "1"
-          trtllm_config:
-            prefill:
-              mem-fraction-static: 0.8
-              chunked-prefill-size: 8192
-            decode:
-              mem-fraction-static: 0.9
+        engine: trtllm
+        roles:
+          prefill:
+            env:
+              CUDA_LAUNCH_BLOCKING: "1"
+            args:
+              max_batch_size: 256
+          decode:
+            args:
+              max_batch_size: 64
     """
 
+    # Engine type discriminator.
     type: Literal["trtllm"] = "trtllm"
+    # trtllm-serve serves Prometheus text at /prometheus/metrics (mounted when
+    # return_perf_metrics is true); its /metrics route is JSON iteration stats.
+    prometheus_metrics_path: ClassVar[str] = "/prometheus/metrics"
+    nvtx_environment: ClassVar[Mapping[str, str]] = {"TLLM_LLMAPI_ENABLE_NVTX": "1", "TLLM_PROFILE_LOG_RANKS": "all"}
 
-    prefill_environment: dict[str, str] = field(default_factory=dict)
-    decode_environment: dict[str, str] = field(default_factory=dict)
-    aggregated_environment: dict[str, str] = field(default_factory=dict)
-
-    # Extra `trtllm-serve` CLI flags per mode, appended verbatim to the worker
-    # command (frontend.type: trtllm_serve only -- dynamo.trtllm takes a
-    # different CLI).
+    # The roles this engine runs (`roles.<role>` of the recipe), bound by SrtConfig and
+    # never written on `engine:`. Per-role env and args (the engine YAML) are read from
+    # here, and so are `roles.<role>.extra_args`: extra `trtllm-serve` CLI flags appended
+    # verbatim to the worker command (frontend.type: trtllm_serve only -- dynamo.trtllm
+    # takes a different CLI).
     #
-    # `trtllm_config` already covers everything that belongs in the engine YAML,
-    # which is nearly everything: trtllm-serve merges that file into LlmArgs. But
-    # a few of its options configure the OpenAI SERVER layer rather than the
-    # engine and have no LlmArgs field, so no YAML key can reach them. The one
-    # that matters in practice is `--tool_parser` (a click.Choice consumed
-    # directly by the server constructor); note that its sibling
-    # `--reasoning_parser` IS forwarded into get_llm_args() and so remains
-    # settable from `trtllm_config`.
+    # `args` already covers everything that belongs in the engine YAML, which is nearly
+    # everything: trtllm-serve merges that file into LlmArgs. But a few of its options
+    # configure the OpenAI SERVER layer rather than the engine and have no LlmArgs field,
+    # so no YAML key can reach them. The one that matters in practice is `--tool_parser`
+    # (a click.Choice consumed directly by the server constructor); note that its sibling
+    # `--reasoning_parser` IS forwarded into get_llm_args() and so remains settable from
+    # `args`.
     #
-    #     backend:
-    #       type: trtllm
-    #       prefill_extra_args: ["--tool_parser", "glm47"]
-    #       decode_extra_args:  ["--tool_parser", "glm47"]
-    prefill_extra_args: list[str] = field(default_factory=list)
-    decode_extra_args: list[str] = field(default_factory=list)
-    aggregated_extra_args: list[str] = field(default_factory=list)
-
-    trtllm_config: TRTLLMServerConfig | None = None
+    #     roles:
+    #       prefill:
+    #         extra_args: ["--tool_parser", "glm47"]
+    #       decode:
+    #         extra_args: ["--tool_parser", "glm47"]
+    roles: Mapping[str, RoleSettings] = field(default_factory=dict, metadata={"marshmallow_field": BoundRolesField()})
 
     # The name clients must use in a request's "model" field.
     # Defaults to the checkpoint directory name.
     #
-    #     backend:
+    #     engine:
     #       type: trtllm
     #       served_model_name: "deepseek-ai/deepseek-r1"
     #
@@ -100,17 +290,28 @@ class TRTLLMProtocol:
     # it fixed in the benchmark definition, so the server must match or every
     # request 404s.
     #
-    # Top-level rather than a trtllm_config key because trtllm_config is dumped
+    # Top-level rather than a roles.<role>.args key because a role's args are dumped
     # straight into the engine's YAML file, and this is a launcher flag the
     # engine does not recognise.
     served_model_name: str | None = None
 
-    # Whether dynamo.trtllm workers pass `--publish-events-and-metrics`.
-    # Enables the worker to publish KV-cache events (add/evict) + metrics, which
-    # the dynamo frontend consumes for KV-cache-aware routing (router-mode: kv).
-    # This may impact performance so should be disabled if exact KV aware routing
-    # is not needed.
-    publish_events_and_metrics: bool = False
+    # Mooncake Store pool for the `mooncake-store` KV connector; a declared
+    # mooncake-master service maps here. Never written on `engine`.
+    mooncake_kv_store: TRTLLMMooncakeKVStoreConfig | None = None
+
+    # Publish TRT-LLM engine metrics without enabling KV-cache events.
+    # Requires a Dynamo build supporting --publish-metrics; set False to omit
+    # the flag for older builds. Native trtllm-serve and sidecars are unaffected.
+    # Iteration statistics stay off regardless: srtctl bakes
+    # enable_iter_perf_stats: false into every engine section unless the recipe
+    # or observability sets it (TRTLLM_ENGINE_DEFAULTS), so this flag costs the
+    # per-request perf metrics only.
+    publish_metrics: bool = True
+
+    # Legacy compatibility flag for Dynamo builds without --publish-metrics.
+    # True emits only --publish-events-and-metrics, regardless of publish_metrics.
+    # False or None uses publish_metrics instead. Observability does not enable it.
+    publish_events_and_metrics: bool | None = None
 
     # Controls batched startup of workers that share the same node.
     # 0 = start all workers in parallel (no constraint).
@@ -120,11 +321,14 @@ class TRTLLMProtocol:
     # For dynamo.trtllm: readiness is a TCP connection on the worker's sys_port.
     sequential_node_start: int = 0
 
-    # Whether to prefix the trtllm worker command with `numactl -m 0,1`.
-    # None (default) preserves the existing auto-detected behavior (enabled
-    # only for gb200/gb300). True/False forces numactl on/off regardless of
-    # gpu_type.
-    numa_memory_bind: bool | None = None
+    # Worker memory policy. None (default) uses `numactl -m 0,1` only for
+    # gb200/gb300/vrnvl72 prefill and decode workers (case-sensitive GPU type).
+    # True uses nodes 0,1 for any GPU type or mode; False leaves the policy
+    # unchanged. CPU binding does not change these policies. "local" requires
+    # numa_cpu_bind=True and strictly binds memory to the task GPU's NUMA node.
+    # Local mode fails startup if GPU NUMA affinity is unknown. Local memory
+    # exhaustion can fail allocations; existing/shared pages are not migrated.
+    numa_memory_bind: bool | Literal["local"] | None = None
 
     # Optional stricter NUMA CPU affinity for the worker process, in addition
     # to numa_memory_bind. A previous post-hoc `taskset -pc <cpuset> $PPID`
@@ -141,12 +345,30 @@ class TRTLLMProtocol:
     #      SLURM_LOCALID is a node-wide GPU ordinal, which breaks when two
     #      endpoints share a node (each gets its own srun step, so LOCALID
     #      restarts at 0 for both).
+    # Set numa_memory_bind="local" to also bind memory to that same NUMA node.
     numa_cpu_bind: bool = False
 
     Schema: ClassVar[builtins.type[Schema]] = Schema
+    process_exporter_groups: ClassVar[tuple[ProcessGroup, ...]] = (
+        ProcessGroup("trtllm_llmapi_launch", cmdline=(r"(^|[ /])trtllm-llmapi-launch( |$)",)),
+        ProcessGroup("trtllm_engine", cmdline=(r"(^| )tensorrt_llm\.llmapi\.mgmn_worker_node( |$)",)),
+        ProcessGroup("dynamo_trtllm", cmdline=(r"dynamo\.trtllm",)),
+        ProcessGroup("trtllm_serve", cmdline=("trtllm-serve",)),
+    )
+
+    def __post_init__(self) -> None:
+        if self.numa_memory_bind == "local" and not self.numa_cpu_bind:
+            raise ValueError("numa_memory_bind: local requires numa_cpu_bind: true")
+
+    @property
+    def dynamo_metrics_flags(self) -> tuple[str, ...]:
+        """Select the legacy combined flag or the metrics-only flag exclusively."""
+        if self.publish_events_and_metrics:
+            return ("--publish-events-and-metrics",)
+        return ("--publish-metrics",) if self.publish_metrics else ()
 
     # =========================================================================
-    # BackendProtocol Implementation
+    # Backend Implementation
     # =========================================================================
 
     def get_srun_config(self) -> "SrunConfig":
@@ -158,55 +380,137 @@ class TRTLLMProtocol:
             oversubscribe=True,
             launch_per_endpoint=True,
             cpu_bind="verbose,none",
+            sequential_node_start=self.sequential_node_start,
+            # A rank exiting non-zero (or the rank-zero sidecar) must end the
+            # whole endpoint step; the launcher would otherwise keep it up.
+            kill_on_bad_exit=True,
         )
 
-    def get_config_for_mode(self, mode: WorkerMode) -> dict[str, Any]:
-        if not self.trtllm_config:
-            return {}
-
-        if mode == "prefill":
-            return dict(self.trtllm_config.prefill or {})
-        elif mode == "decode":
-            return dict(self.trtllm_config.decode or {})
-        elif mode == "agg":
-            return dict(self.trtllm_config.aggregated or {})
-        return {}
+    def fatal_log_patterns(self, mode: WorkerMode) -> tuple[str, ...]:
+        """The launcher's task-exit line and the executor's start-up failure, for every mode."""
+        return TRTLLM_FATAL_LOG_PATTERNS
 
     def get_extra_args_for_mode(self, mode: WorkerMode) -> list[str]:
-        """Extra trtllm-serve CLI flags for this mode (see the field docs)."""
-        by_mode: dict[WorkerMode, list[str]] = {
-            "prefill": self.prefill_extra_args,
-            "decode": self.decode_extra_args,
-            "agg": self.aggregated_extra_args,
-        }
-        return list(by_mode.get(mode) or [])
+        """Extra trtllm-serve CLI flags for this mode (``roles.<role>.extra_args``)."""
+        role = role_for_mode(self.roles, mode)
+        return list(role.extra_args) if role is not None else []
 
     def get_environment_for_mode(self, mode: WorkerMode) -> dict[str, str]:
         eplb_prefix = f"moe_shared_{uuid.uuid4().hex}"
-
-        env_by_mode: dict[WorkerMode, dict[str, str]] = {
-            "prefill": self.prefill_environment,
-            "decode": self.decode_environment,
-            "agg": self.aggregated_environment,
-        }
-        base_env = env_by_mode.get(mode)
-        if base_env is None:
-            return {}
-        env = {**base_env, "TRTLLM_EPLB_SHM_NAME": eplb_prefix}
+        env = {**role_env(self.roles, mode), "TRTLLM_EPLB_SHM_NAME": eplb_prefix}
         if self.numa_cpu_bind:
             env["TLLM_NUMA_AWARE_WORKER_AFFINITY"] = "0"
         return env
 
-    def get_process_environment(self, process: "Process") -> dict[str, str]:
-        """Get process-specific environment variables.
-
-        TRTLLM doesn't currently require process-specific env vars.
-        """
-        return {}
-
     def get_served_model_name(self, default: str) -> str:
         """Get the configured served model name, or return default."""
         return self.served_model_name or default
+
+    def dwdp_size(self, mode: WorkerMode) -> int:
+        """``dwdp_config.dwdp_size`` of a role's engine args; 0 when the role is not a DWDP group."""
+        dwdp = self.get_config_for_mode(mode).get("dwdp_config")
+        if not isinstance(dwdp, Mapping):
+            return 0
+        try:
+            return int(dwdp.get("dwdp_size") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def dwdp_private_dir(self, process: "Process") -> str:
+        """Container path of a DWDP worker's private HOME (module and autotuner caches live under it)."""
+        return f"{_CONTAINER_LOG_DIR}/worker_priv/{process.endpoint_mode}_w{process.endpoint_index}"
+
+    def get_process_environment(self, process: "Process") -> dict[str, str]:
+        """Per-worker DWDP environment (see the DWDP note at the top of this module); empty otherwise.
+
+        The master address is not known here (another endpoint's node) -- the
+        worker stage sets ``TRTLLM_DWDP_MASTER_ADDR`` from the role's rank-0
+        endpoint when it sees ``TRTLLM_DWDP_RANK``.
+        """
+        mode = process.endpoint_mode
+        if not self.dwdp_size(mode):
+            return {}
+        role_env = self.get_environment_for_mode(mode)
+        private = self.dwdp_private_dir(process)
+        env = {
+            DWDP_RANK_ENV: str(process.endpoint_index),
+            DWDP_MASTER_PORT_ENV: str(DWDP_MASTER_PORT),
+            DWDP_RENDEZVOUS_TIMEOUT_ENV: str(DWDP_RENDEZVOUS_TIMEOUT_S),
+        }
+        for key, value in (
+            ("HOME", private),
+            ("HF_MODULES_CACHE", f"{private}/hf_modules"),
+            ("TLLM_AUTOTUNER_CACHE_PATH", f"{private}/autotune_cache.json"),
+        ):
+            if key not in role_env:
+                env[key] = value
+        # The recipe may pin the port / timeout for the whole role.
+        for key in (DWDP_MASTER_PORT_ENV, DWDP_RENDEZVOUS_TIMEOUT_ENV):
+            if key in role_env:
+                env.pop(key)
+        return env
+
+    def uses_mooncake_store(self, mode: WorkerMode) -> bool:
+        """Whether this mode's engine config resolves to the Mooncake Store KV connector.
+
+        The rule TRT-LLM applies: compare the resolved module, which the ``mooncake-store``
+        preset supplies only when ``connector_module`` is unset.
+        """
+        connector = self.get_config_for_mode(mode).get("kv_connector_config")
+        if not isinstance(connector, Mapping):
+            return False
+        module = connector.get("connector_module")
+        if module is None and connector.get("connector") == TRTLLM_MOONCAKE_STORE_CONNECTOR:
+            module = TRTLLM_MOONCAKE_STORE_MODULE
+        return module == TRTLLM_MOONCAKE_STORE_MODULE
+
+    def mooncake_store_modes(self) -> tuple[WorkerMode, ...]:
+        """The worker modes whose engine config selects the ``mooncake-store`` KV connector."""
+        modes: tuple[WorkerMode, ...] = ("prefill", "decode", "agg")
+        return tuple(mode for mode in modes if self.uses_mooncake_store(mode))
+
+    def build_mooncake_store_config(
+        self, mode: WorkerMode, infra_node_ip: str, served_model_name: str
+    ) -> dict[str, Any]:
+        """The Mooncake client config a ``mode`` worker reads from ``MOONCAKE_CONFIG_PATH``.
+
+        Layers, later wins: the role default and ``model_key`` (the served model name;
+        the pool belongs to this job alone), the service's ``options.store_config``, then
+        ``roles.<mode>.mooncake_store_config``. Keys pass through to TRT-LLM's reader,
+        which supplies its own defaults. ``master_server_address`` is always the master
+        srtslurm launches; a value set by hand is ignored, as for vLLM.
+        """
+        payload: dict[str, Any] = {"role": TRTLLM_MOONCAKE_DEFAULT_ROLES[mode], "model_key": served_model_name}
+        store = self.mooncake_kv_store
+        if store is not None:
+            payload.update(store.store_config or {})
+        payload.update(role_mooncake_store_config(self.roles, mode))
+        payload["master_server_address"] = f"{infra_node_ip}:{MOONCAKE_MASTER_PORT}"
+        return payload
+
+    def mooncake_store_configs(self, infra_node_ip: str, served_model_name: str) -> dict[str, dict[str, Any]]:
+        """One client config per role that uses the ``mooncake-store`` connector."""
+        if self.mooncake_kv_store is None:
+            return {}
+        return {
+            trtllm_mooncake_store_config_filename(mode): self.build_mooncake_store_config(
+                mode, infra_node_ip, served_model_name
+            )
+            for mode in self.mooncake_store_modes()
+        }
+
+    def get_mooncake_worker_env(
+        self, infra_node_ip: str, local_hostname: str, mode: WorkerMode | None = None
+    ) -> dict[str, str]:
+        """The shared MOONCAKE_* environment plus this role's ``MOONCAKE_CONFIG_PATH``.
+
+        Set on the srun task, so every rank ``trtllm-llmapi-launch`` starts inherits
+        it; a path exported from inside the engine process would not reach them.
+        """
+        env = super().get_mooncake_worker_env(infra_node_ip, local_hostname, mode)
+        if env and mode is not None and self.uses_mooncake_store(mode):
+            env["MOONCAKE_CONFIG_PATH"] = f"/logs/{trtllm_mooncake_store_config_filename(mode)}"
+        return env
 
     def allocate_endpoints(
         self,
@@ -233,6 +537,7 @@ class TRTLLMProtocol:
             gpus_per_node=gpus_per_node,
             available_nodes=available_nodes,
             spread_workers=spread_workers,
+            pack_multinode_workers=True,
         )
 
     def endpoints_to_processes(
@@ -243,12 +548,16 @@ class TRTLLMProtocol:
         frontend_type: str = "dynamo",
         dynamo_sidecar: bool = False,
     ) -> list["Process"]:
-        """Convert endpoints to processes."""
-        from srtctl.core.topology import endpoints_to_processes
+        """Convert endpoints to processes, each with its torch.distributed bootstrap port."""
+        from srtctl.core.topology import endpoints_to_processes, port_allocator_for
 
-        return endpoints_to_processes(endpoints, base_sys_port=base_sys_port, port_allocator=port_allocator)
+        allocator = port_allocator_for(port_allocator, base_sys_port)
+        processes = endpoints_to_processes(endpoints, port_allocator=allocator, sidecar_grpc=dynamo_sidecar)
+        # MASTER_PORT for the endpoint is the leader's; every process gets one so
+        # the allocation is uniform and any rank could lead.
+        return [replace(p, trtllm_dist_init_port=allocator.next(TRTLLM_DIST_INIT_PORTS)) for p in processes]
 
-    def _wrap_with_numa_cpu_bind(self, cmd: list[str]) -> list[str]:
+    def _wrap_with_numa_cpu_bind(self, cmd: list[str], *, bind_memory: bool) -> list[str]:
         """Wrap ``cmd`` in configs/numa_cpu_bind.sh, which taskset-binds per task.
 
         Applies to all worker modes (prefill/decode/agg) when numa_cpu_bind
@@ -261,7 +570,8 @@ class TRTLLMProtocol:
         """
         if not self.numa_cpu_bind:
             return cmd
-        return ["bash", "/configs/numa_cpu_bind.sh", *cmd]
+        memory_args = ["--bind-memory"] if bind_memory else []
+        return ["bash", "/configs/numa_cpu_bind.sh", *memory_args, *cmd]
 
     def build_worker_command(
         self,
@@ -275,12 +585,16 @@ class TRTLLMProtocol:
     ) -> list[str]:
         """Build the command to start a TRTLLM worker process."""
 
+        from srtctl.frontends import get_frontend
+
         mode = process.endpoint_mode
         config = self.get_config_for_mode(mode)
+        # The frontend owns the worker shape; nothing below compares frontend names.
+        frontend = get_frontend(frontend_type)
 
         sidecar_config = get_dynamo_sidecar_config(runtime)
         if sidecar_config is not None:
-            if frontend_type != "dynamo":
+            if frontend.worker_launch != "dynamo":
                 raise ValueError("TensorRT-LLM sidecar mode requires frontend.type: dynamo")
             if mode != "agg":
                 raise ValueError("TensorRT-LLM sidecar mode supports aggregated workers only")
@@ -299,9 +613,11 @@ class TRTLLMProtocol:
         model_arg = runtime.worker_model_arg
 
         if self.numa_memory_bind is None:
-            use_numactl = runtime.gpu_type in ("gb200", "gb300") and mode in ("prefill", "decode")
+            use_numactl = runtime.gpu_type in ("gb200", "gb300", "vrnvl72") and mode in ("prefill", "decode")
         else:
-            use_numactl = self.numa_memory_bind
+            use_numactl = self.numa_memory_bind is True
+        # Only explicit local mode moves the memory policy into the CPU wrapper.
+        bind_local_memory = self.numa_memory_bind == "local"
         numactl_prefix = ["numactl", "-m", "0,1"] if use_numactl else []
         base_prefix = list(nsys_prefix or []) + numactl_prefix + ["trtllm-llmapi-launch"]
 
@@ -313,6 +629,7 @@ class TRTLLMProtocol:
                 container_config_path=container_config_path,
                 base_prefix=base_prefix,
                 sidecar_config=sidecar_config,
+                bind_memory=bind_local_memory,
             )
 
         # trtllm-serve path: launch an OpenAI-compatible trtllm-serve worker. In
@@ -321,8 +638,8 @@ class TRTLLMProtocol:
         # worker is also the public frontend, so it binds runtime.frontend_port.
         # There is no Dynamo request plane and no --disaggregation-mode: a disagg
         # worker is prefill or decode purely by which list it appears in in ser.yaml.
-        if frontend_type == "trtllm_serve":
-            http_port = runtime.frontend_port if mode == "agg" else process.http_port
+        if frontend.worker_launch == "direct":
+            http_port = runtime.frontend_port if frontend.worker_api_port(mode) == "public" else process.http_port
             cmd = base_prefix + [
                 "trtllm-serve",
                 model_arg,
@@ -345,8 +662,10 @@ class TRTLLMProtocol:
             # ai-dynamo tensorrtllm-runtime 1.3.0-dev.1 container, which accept --config;
             # some trtllm-serve builds spell this --extra_llm_api_options.
             cmd.extend(["--config", str(container_config_path)])
+            if self.served_model_name:
+                cmd.extend(["--served_model_name", self.served_model_name])
             cmd.extend(self.get_extra_args_for_mode(mode))
-            return self._wrap_with_numa_cpu_bind(cmd)
+            return self._wrap_with_numa_cpu_bind(cmd, bind_memory=bind_local_memory)
 
         # dynamo.trtllm path (default): workers register into etcd/NATS and the dynamo
         # frontend discovers them.
@@ -373,10 +692,9 @@ class TRTLLMProtocol:
             ]
         )
 
-        if self.publish_events_and_metrics:
-            cmd.append("--publish-events-and-metrics")
+        cmd.extend(self.dynamo_metrics_flags)
 
-        return self._wrap_with_numa_cpu_bind(cmd)
+        return self._wrap_with_numa_cpu_bind(cmd, bind_memory=bind_local_memory)
 
     def _build_sidecar_command(
         self,
@@ -387,9 +705,10 @@ class TRTLLMProtocol:
         container_config_path: Path,
         base_prefix: list[str],
         sidecar_config: "DynamoConfig",
+        bind_memory: bool,
     ) -> list[str]:
         """Build a lifecycle-coupled TensorRT-LLM native-gRPC and sidecar launch."""
-        grpc_port = sidecar_grpc_port(sidecar_config.sidecar_port, process)
+        grpc_port = sidecar_grpc_port(process)
         engine = self._wrap_with_numa_cpu_bind(
             base_prefix
             + [
@@ -404,7 +723,8 @@ class TRTLLMProtocol:
                 str(grpc_port),
                 "--extra_llm_api_options",
                 str(container_config_path),
-            ]
+            ],
+            bind_memory=bind_memory,
         )
 
         sidecar = (

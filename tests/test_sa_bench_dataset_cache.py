@@ -156,7 +156,11 @@ def test_cache_hit_reports_timestamp_and_full_path(sa_bench, counting_builder, t
     _load(sa_bench, str(tmp_path))
 
     out = capsys.readouterr().out
-    assert re.search(rf"^\[\d{{2}}:\d{{2}}:\d{{2}}\] \[cache\] hit: loaded 32 prompts from {cache_file}", out, re.M)
+    assert re.search(
+        rf"^\[\d{{2}}:\d{{2}}:\d{{2}}\] \[cache\] hit: loaded 32 prompts from {cache_file}",
+        out,
+        re.MULTILINE,
+    )
     assert "generating" not in out
 
 
@@ -178,6 +182,7 @@ def test_cache_file_name_is_human_readable(sa_bench, counting_builder, tmp_path)
         {"seed": 1},
         {"range_ratio": 0.8},
         {"use_chat_template": False},
+        {"wrap_chat_template": False},
     ],
 )
 def test_differing_parameters_do_not_share_a_cache_entry(sa_bench, counting_builder, tmp_path, override):
