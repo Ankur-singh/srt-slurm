@@ -40,6 +40,19 @@ def _describe_file(path: Path) -> str:
     return result.stdout.strip()
 
 
+def arch_from_binary(path: Path) -> str | None:
+    """The architecture an installed binary was built for, when it can be read."""
+    if not path.exists():
+        return None
+
+    description = _describe_file(path)
+    if "aarch64" in description or "ARM aarch64" in description:
+        return "aarch64"
+    if "x86-64" in description or "x86_64" in description:
+        return "x86_64"
+    return None
+
+
 def arch_from_uv_binary(source_dir: Path) -> str | None:
     """Infer compute arch from the uv binary installed by make setup ARCH=..."""
     uv_bin = source_dir / "bin" / "uv"
@@ -229,7 +242,8 @@ def install(env: Env | None = None) -> None:
         if wheel_dir.is_dir():
             find_links_args.extend(["--find-links", str(wheel_dir)])
 
-    print(f"Installing ai-dynamo-runtime and ai-dynamo {version} from local wheels")
+    # Install the exact staged artifacts and resolve their dependencies from the package indexes.
+    print(f"Installing ai-dynamo-runtime and ai-dynamo {version} from local wheels with dependencies")
     subprocess.run(
         [
             sys.executable,
@@ -237,11 +251,13 @@ def install(env: Env | None = None) -> None:
             "pip",
             "install",
             "--pre",
-            "--no-deps",
-            "--no-index",
+            "--index-url",
+            runtime_env.get("DYNAMO_INDEX_URL", DEFAULT_INDEX_URL),
+            "--extra-index-url",
+            runtime_env.get("DYNAMO_EXTRA_INDEX_URL", DEFAULT_EXTRA_INDEX_URL),
             *find_links_args,
-            f"ai-dynamo-runtime=={version}",
-            f"ai-dynamo=={version}",
+            str(runtime_wheel),
+            str(dynamo_wheel),
         ],
         check=True,
     )

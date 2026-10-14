@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import ClassVar
 
 from srtctl.benchmarks.base import BenchmarkRunner, register_benchmark
 from srtctl.core.runtime import RuntimeContext
@@ -39,9 +40,12 @@ class CustomBenchmarkRunner(BenchmarkRunner):
     * Runtime-discovered frontend and logical worker endpoints are injected
       through ``SRT_*`` environment variables. Custom AIPerf commands also
       receive ``AIPERF_SERVER_METRICS_URLS``. Multi-node follower ranks are
-      intentionally excluded; see ``docs/config-reference.md`` for the full
+      intentionally excluded; see ``docs/benchmarks.md`` for the full
       contract.
     """
+
+    # BenchmarkConfig fields this runner reads (beyond the shared ones); see benchmark_config_fields().
+    config_fields: ClassVar[frozenset[str]] = frozenset({"command", "container_image", "env"})
 
     @property
     def name(self) -> str:

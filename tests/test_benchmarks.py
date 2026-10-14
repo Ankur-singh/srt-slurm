@@ -7,6 +7,7 @@ import pytest
 
 from srtctl.benchmarks import get_runner, list_benchmarks
 from srtctl.benchmarks.base import SCRIPTS_DIR
+from srtctl.core.schema import PlacementConfig
 
 
 class TestBenchmarkRegistry:
@@ -164,6 +165,66 @@ class TestSABenchRunner:
         assert cmd[-2] == ""  # empty dataset path
         assert cmd[-1] == "false"  # per-request HTTP sessions by default
 
+    def test_build_command_custom_endpoint(self):
+        """build_command passes the API path through to bench.sh."""
+        from unittest.mock import MagicMock
+
+        from srtctl.benchmarks.sa_bench import SABenchRunner
+
+        runner = SABenchRunner()
+        runtime = MagicMock(frontend_port=8000, model_path="/model", is_hf_model=False)
+
+        cmd = runner.build_command(self._endpoint_config("/v1/chat/completions"), runtime)
+
+        assert cmd[-2:] == ["", "/v1/chat/completions"]
+
+    def test_build_command_cache_precedes_custom_endpoint(self):
+        """The cache and endpoint occupy distinct trailing bench.sh arguments."""
+        from dataclasses import replace
+        from unittest.mock import MagicMock
+
+        from srtctl.benchmarks.sa_bench import DATASET_CACHE_MOUNT, SABenchRunner
+
+        runner = SABenchRunner()
+        runtime = MagicMock(frontend_port=8000, model_path="/model", is_hf_model=False)
+        config = self._endpoint_config("/v1/chat/completions")
+        config = replace(config, benchmark=replace(config.benchmark, dataset_cache_dir="/lustre/cache"))
+
+        cmd = runner.build_command(config, runtime)
+
+        assert cmd[-2:] == [DATASET_CACHE_MOUNT, "/v1/chat/completions"]
+
+    def _endpoint_config(self, endpoint):
+        from srtctl.core.schema import BenchmarkConfig, ModelConfig, ResourceConfig, SrtConfig
+
+        return SrtConfig(
+            name="test",
+            model=ModelConfig(path="/model", container="/image", precision="fp4"),
+            resources=ResourceConfig(gpu_type="h100"),
+            benchmark=BenchmarkConfig(
+                type="sa-bench",
+                isl=8192,
+                osl=1024,
+                concurrencies="2560",
+                endpoint=endpoint,
+            ),
+        )
+
+    @pytest.mark.parametrize("endpoint", ["/v1/completions", "/v1/chat/completions"])
+    def test_validate_config_accepts_both_api_paths(self, endpoint):
+        """The dynamo adapter serves both APIs, so neither needs extra config."""
+        from srtctl.benchmarks.sa_bench import SABenchRunner
+
+        assert SABenchRunner().validate_config(self._endpoint_config(endpoint)) == []
+
+    def test_validate_config_rejects_relative_endpoint(self):
+        """bench.sh appends the path to the frontend URL, so it must be absolute."""
+        from srtctl.benchmarks.sa_bench import SABenchRunner
+
+        errors = SABenchRunner().validate_config(self._endpoint_config("v1/chat/completions"))
+
+        assert any("absolute path" in error for error in errors)
+
     def test_build_command_enables_http_connection_reuse(self):
         """Explicit opt-in is appended without shifting existing arguments."""
         from unittest.mock import MagicMock
@@ -191,6 +252,84 @@ class TestSABenchRunner:
 
         assert cmd[-2] == "/data/bench.jsonl"
         assert cmd[-1] == "true"
+
+    def test_build_command_passes_container_cache_path(self):
+        """bench.sh receives the mount point, never the host path."""
+        from unittest.mock import MagicMock
+
+        from srtctl.benchmarks.sa_bench import DATASET_CACHE_MOUNT, SABenchRunner
+        from srtctl.core.schema import BenchmarkConfig, ModelConfig, ResourceConfig, SrtConfig
+
+        runner = SABenchRunner()
+        runtime = MagicMock(frontend_port=8000, model_path="/model", is_hf_model=False)
+        config = SrtConfig(
+            name="test",
+            model=ModelConfig(path="/model", container="/image", precision="fp4"),
+            resources=ResourceConfig(gpu_type="h100"),
+            benchmark=BenchmarkConfig(
+                type="sa-bench",
+                isl=1024,
+                osl=128,
+                concurrencies="4x8",
+                dataset_cache_dir="/lustre/shared/sa-bench-cache",
+            ),
+        )
+
+        cmd = runner.build_command(config, runtime)
+
+        assert cmd[-1] == DATASET_CACHE_MOUNT
+        assert "/lustre/shared/sa-bench-cache" not in cmd
+
+    def test_get_container_mounts_adds_cache_dir(self, tmp_path):
+        """The host cache dir is created and mounted at the fixed container path."""
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        from srtctl.benchmarks.sa_bench import DATASET_CACHE_MOUNT, SABenchRunner
+        from srtctl.core.schema import BenchmarkConfig, ModelConfig, ResourceConfig, SrtConfig
+
+        runner = SABenchRunner()
+        runtime = MagicMock(container_mounts={Path("/logs"): Path("/logs")})
+        host_cache = tmp_path / "sa-bench-cache"
+        config = SrtConfig(
+            name="test",
+            model=ModelConfig(path="/model", container="/image", precision="fp4"),
+            resources=ResourceConfig(gpu_type="h100"),
+            benchmark=BenchmarkConfig(
+                type="sa-bench", isl=1024, osl=128, concurrencies="4x8", dataset_cache_dir=str(host_cache)
+            ),
+        )
+
+        mounts = runner.get_container_mounts(config, runtime)
+
+        assert host_cache.is_dir()
+        assert mounts[host_cache.resolve()] == Path(DATASET_CACHE_MOUNT)
+        assert mounts[Path("/logs")] == Path("/logs")
+
+    def test_get_container_mounts_unchanged_without_cache_dir(self):
+        """Mounts are untouched when the feature is not configured."""
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        from srtctl.benchmarks.sa_bench import SABenchRunner
+        from srtctl.core.schema import BenchmarkConfig, ModelConfig, ResourceConfig, SrtConfig
+
+        runner = SABenchRunner()
+        runtime = MagicMock(container_mounts={Path("/logs"): Path("/logs")})
+        config = SrtConfig(
+            name="test",
+            model=ModelConfig(path="/model", container="/image", precision="fp4"),
+            resources=ResourceConfig(gpu_type="h100"),
+            benchmark=BenchmarkConfig(type="sa-bench", isl=1024, osl=128, concurrencies="4x8"),
+        )
+
+        assert runner.get_container_mounts(config, runtime) == {Path("/logs"): Path("/logs")}
+
+    def test_dataset_cache_dir_schema_default(self):
+        """The YAML field stays opt-in when omitted."""
+        from srtctl.core.schema import BenchmarkConfig
+
+        assert BenchmarkConfig().dataset_cache_dir is None
 
     def test_http_connection_reuse_schema_default_and_roundtrip(self):
         """The YAML field is typed and remains opt-in when omitted."""
@@ -233,11 +372,19 @@ class TestCustomBenchmarkRunner:
         processes,
         *,
         benchmark_type="custom",
+        backend_type="sglang",
+        publish_metrics=True,
+        publish_events_and_metrics=None,
         prefill_environment=None,
         aggregated_environment=None,
+        environment=None,
+        dynamo_sidecar=False,
+        trtllm_config=None,
+        engine_args=None,
     ):
         from types import SimpleNamespace
 
+        from srtctl.backends import TRTLLMBackend
         from srtctl.cli.mixins.benchmark_stage import BenchmarkStageMixin
 
         class Stage(BenchmarkStageMixin):
@@ -245,20 +392,61 @@ class TestCustomBenchmarkRunner:
             def backend_processes(self):
                 return processes
 
-        stage = Stage()
-        stage.config = SimpleNamespace(
-            benchmark=SimpleNamespace(type=benchmark_type, aiperf_package=None),
-            backend=SimpleNamespace(
+        # Mirrors TRTLLMBackend.get_config_for_mode: the engine yaml section for
+        # a worker mode ("agg" maps to the "aggregated" section).
+        engine_sections = trtllm_config or {}
+
+        def get_config_for_mode(mode):
+            return dict(engine_sections.get("aggregated" if mode == "agg" else mode, {}))
+
+        mode_environments = {"prefill": prefill_environment or {}, "agg": aggregated_environment or {}}
+
+        def get_environment_for_mode(mode):
+            return dict(mode_environments.get(mode, {}))
+
+        if backend_type == "trtllm":
+            from srtctl.core.schema import RoleConfig
+
+            backend = TRTLLMBackend(
+                publish_metrics=publish_metrics,
+                publish_events_and_metrics=publish_events_and_metrics,
+                roles={
+                    role: RoleConfig(env=mode_environments.get(role, {}), args=engine_sections.get(mode) or {})
+                    for role, mode in (("prefill", "prefill"), ("decode", "decode"), ("agg", "aggregated"))
+                    if role in mode_environments or mode in engine_sections
+                },
+            )
+        elif engine_args is not None:
+            from srtctl.backends import SGLangBackend
+            from srtctl.core.schema import RoleConfig
+
+            backend = SGLangBackend(roles={role: RoleConfig(args=args) for role, args in engine_args.items()})
+        else:
+            backend = SimpleNamespace(
+                type=backend_type,
+                prometheus_metrics_path="/metrics",
+                is_grpc_mode=lambda mode: False,
+                publish_metrics=publish_metrics,
+                publish_events_and_metrics=publish_events_and_metrics,
                 prefill_environment=prefill_environment or {},
                 aggregated_environment=aggregated_environment or {},
-            ),
-            frontend=SimpleNamespace(type=frontend_type),
+                get_config_for_mode=get_config_for_mode,
+                get_environment_for_mode=get_environment_for_mode,
+            )
+
+        stage = Stage()
+        stage.config = SimpleNamespace(
+            benchmark=SimpleNamespace(type=benchmark_type, aiperf_package=None, placement=PlacementConfig()),
+            backend=backend,
+            backend_type=backend_type,
+            dynamo=SimpleNamespace(sidecar=dynamo_sidecar),
+            frontend=SimpleNamespace(type=frontend_type, placement=PlacementConfig()),
             profiling=SimpleNamespace(enabled=False),
-            resources=SimpleNamespace(num_agg=sum(p.endpoint_mode == "agg" and p.is_leader for p in processes)),
+            topology=SimpleNamespace(num_agg=sum(p.endpoint_mode == "agg" and p.is_leader for p in processes)),
             telemetry=SimpleNamespace(enabled=False),
         )
         stage.runtime = SimpleNamespace(
-            environment={},
+            environment=environment or {},
             frontend_port=8000,
             network_interface="ibp1s0",
             nodes=SimpleNamespace(head="head-node"),
@@ -305,6 +493,54 @@ class TestCustomBenchmarkRunner:
         assert runner.get_container_image(config, runtime) == "nvcr.io/nvidia/python:3.11"
         assert runner.get_environment(config, runtime) == {"FOO": "bar"}
 
+    @staticmethod
+    def _two_node_disagg_processes():
+        from srtctl.core.topology import Process
+
+        # Decode nodes sort before prefill nodes, so a sorted URL list would reorder roles.
+        return [
+            Process("node-p0", frozenset(range(4)), 7500, 6100, "prefill", 0, node_rank=0),
+            Process("node-p1", frozenset(range(4)), 7501, 0, "prefill", 0, node_rank=1),
+            Process("node-d0", frozenset(range(4)), 7504, 6100, "decode", 0, node_rank=0),
+            Process("node-d1", frozenset(range(4)), 7505, 0, "decode", 0, node_rank=1),
+        ]
+
+    def _custom_env(self, engine_args, **kwargs):
+        from unittest.mock import patch
+
+        from srtctl.benchmarks.custom import CustomBenchmarkRunner
+
+        stage = self._benchmark_stage("dynamo", self._two_node_disagg_processes(), engine_args=engine_args, **kwargs)
+        with patch(
+            "srtctl.cli.mixins.benchmark_stage.get_hostname_ip",
+            side_effect=lambda node, interface: f"ip-{node}",
+        ):
+            return stage._get_benchmark_env(CustomBenchmarkRunner())
+
+    @pytest.mark.parametrize("dp_key", ["dp-size", "dp_size", "data-parallel-size"])
+    def test_sglang_attention_dp_custom_metrics_scrape_followers_in_topology_order(self, dp_key):
+        env = self._custom_env({"prefill": {dp_key: 8}, "decode": {dp_key: 8}})
+
+        # Routing still targets logical leaders; only metrics include follower ranks.
+        assert env["SRT_PREFILL_ENDPOINTS"] == "ip-node-p0:7500"
+        assert env["SRT_DECODE_ENDPOINTS"] == "ip-node-d0:7504"
+        assert env["AIPERF_SERVER_METRICS_URLS"] == (
+            "http://ip-node-p0:7500/metrics,http://ip-node-p1:7501/metrics,"
+            "http://ip-node-d0:7504/metrics,http://ip-node-d1:7505/metrics"
+        )
+
+    def test_sglang_attention_dp_followers_are_scraped_per_role(self):
+        env = self._custom_env({"prefill": {"tp-size": 8}, "decode": {"dp-size": 8}})
+
+        assert env["AIPERF_SERVER_METRICS_URLS"] == (
+            "http://ip-node-p0:7500/metrics,http://ip-node-d0:7504/metrics,http://ip-node-d1:7505/metrics"
+        )
+
+    def test_sglang_pure_tp_custom_metrics_keep_logical_leaders(self):
+        env = self._custom_env({"prefill": {"tp-size": 8}, "decode": {"tp-size": 8}})
+
+        assert env["AIPERF_SERVER_METRICS_URLS"] == "http://ip-node-p0:7500/metrics,http://ip-node-d0:7504/metrics"
+
     def test_disaggregated_worker_endpoints_use_logical_leaders(self):
         from unittest.mock import patch
 
@@ -336,6 +572,74 @@ class TestCustomBenchmarkRunner:
             "http://ip-node-a:7500/metrics,http://ip-node-c:7502/metrics,http://ip-node-e:7504/metrics"
         )
 
+    def test_tilert_custom_metrics_exclude_decode_without_hiding_routing_endpoints(self):
+        from unittest.mock import patch
+
+        from srtctl.benchmarks.custom import CustomBenchmarkRunner
+        from srtctl.core.topology import Process
+
+        processes = [
+            Process("node-a", frozenset(range(8)), 7500, 6100, "prefill", 0),
+            Process("node-b", frozenset(range(4)), 7501, 6100, "decode", 0),
+            Process("node-b", frozenset(range(4, 8)), 7502, 6132, "decode", 1),
+        ]
+        stage = self._benchmark_stage("tilert-router", processes, backend_type="tilert")
+
+        with patch(
+            "srtctl.cli.mixins.benchmark_stage.get_hostname_ip",
+            side_effect=lambda node, interface: f"ip-{node}",
+        ):
+            env = stage._get_benchmark_env(CustomBenchmarkRunner())
+
+        assert env["AIPERF_SERVER_METRICS_URLS"] == "http://ip-node-a:6100/metrics"
+        assert env["SRT_PREFILL_ENDPOINTS"] == "ip-node-a:6100"
+        assert env["SRT_DECODE_ENDPOINTS"] == "ip-node-b:6100,ip-node-b:6132"
+
+    def test_vllm_router_custom_metrics_retain_nonleader_node_local_dp_pools(self):
+        from unittest.mock import patch
+
+        from srtctl.benchmarks.custom import CustomBenchmarkRunner
+        from srtctl.core.topology import Process
+
+        processes = [
+            Process("node-a", frozenset(range(8)), 7500, 6100, "decode", 0, node_rank=0),
+            Process("node-b", frozenset(range(8)), 7501, 6100, "decode", 0, node_rank=1),
+        ]
+        stage = self._benchmark_stage("vllm-router", processes, backend_type="vllm")
+
+        with patch(
+            "srtctl.cli.mixins.benchmark_stage.get_hostname_ip",
+            side_effect=lambda node, interface: f"ip-{node}",
+        ):
+            env = stage._get_benchmark_env(CustomBenchmarkRunner())
+
+        assert env["AIPERF_SERVER_METRICS_URLS"] == "http://ip-node-a:6100/metrics,http://ip-node-b:6100/metrics"
+        assert env["SRT_DECODE_ENDPOINTS"] == "ip-node-a:6100,ip-node-b:6100"
+
+    def test_sidecar_worker_endpoints_use_native_sglang_http_ports(self):
+        from unittest.mock import patch
+
+        from srtctl.benchmarks.custom import CustomBenchmarkRunner
+        from srtctl.core.topology import Process
+
+        processes = [
+            Process("node-a", frozenset(range(4)), 7500, 6100, "prefill", 0, node_rank=0),
+            Process("node-b", frozenset(range(4)), 7501, 0, "prefill", 0, node_rank=1),
+            Process("node-c", frozenset(range(4)), 7502, 6100, "decode", 0, node_rank=0),
+            Process("node-d", frozenset(range(4)), 7503, 0, "decode", 0, node_rank=1),
+        ]
+        stage = self._benchmark_stage("dynamo", processes, dynamo_sidecar=True)
+
+        with patch(
+            "srtctl.cli.mixins.benchmark_stage.get_hostname_ip",
+            side_effect=lambda node, interface: f"ip-{node}",
+        ):
+            env = stage._get_benchmark_env(CustomBenchmarkRunner())
+
+        assert env["SRT_PREFILL_ENDPOINTS"] == "ip-node-a:6100"
+        assert env["SRT_DECODE_ENDPOINTS"] == "ip-node-c:6100"
+        assert env["AIPERF_SERVER_METRICS_URLS"] == ("http://ip-node-a:6100/metrics,http://ip-node-c:6100/metrics")
+
     def test_aggregated_worker_endpoint_uses_http_port_without_dynamo(self):
         from unittest.mock import patch
 
@@ -346,7 +650,7 @@ class TestCustomBenchmarkRunner:
             Process("node-a", frozenset(range(4)), 7500, 6100, "agg", 0, node_rank=0),
             Process("node-b", frozenset(range(4)), 7501, 0, "agg", 0, node_rank=1),
         ]
-        stage = self._benchmark_stage("sglang", processes)
+        stage = self._benchmark_stage("sglang-router", processes)
 
         with patch(
             "srtctl.cli.mixins.benchmark_stage.get_hostname_ip",
@@ -359,6 +663,123 @@ class TestCustomBenchmarkRunner:
         assert "SRT_PREFILL_ENDPOINTS" not in env
         assert "SRT_DECODE_ENDPOINTS" not in env
         assert env["AIPERF_SERVER_METRICS_URLS"] == "http://ip-node-a:6100/metrics"
+
+        # Direct sglang: the one aggregate worker is the public endpoint on the frontend port.
+        direct = self._benchmark_stage("sglang", processes)
+        with patch(
+            "srtctl.cli.mixins.benchmark_stage.get_hostname_ip",
+            side_effect=lambda node, interface: f"ip-{node}",
+        ):
+            env = direct._get_benchmark_env(CustomBenchmarkRunner())
+        port = direct.runtime.frontend_port
+        assert env["SRT_AGG_ENDPOINTS"] == f"ip-node-a:{port}"
+        assert env["AIPERF_SERVER_METRICS_URLS"] == f"http://ip-node-a:{port}/metrics"
+
+    def test_trtllm_serve_custom_endpoints_use_prometheus_path(self):
+        """Custom benchmarks against trtllm-serve advertise worker leaders'
+        OpenAI ports at /prometheus/metrics — the plain /metrics route there
+        is JSON iteration stats, not Prometheus exposition text."""
+        from unittest.mock import patch
+
+        from srtctl.benchmarks.custom import CustomBenchmarkRunner
+        from srtctl.core.topology import Process
+
+        processes = [
+            Process("node-a", frozenset(range(4)), 7500, 6100, "prefill", 0, node_rank=0),
+            Process("node-b", frozenset(range(4)), 7501, 0, "prefill", 0, node_rank=1),
+            Process("node-c", frozenset(range(4)), 7502, 6100, "decode", 0, node_rank=0),
+        ]
+        stage = self._benchmark_stage("trtllm_serve", processes, backend_type="trtllm")
+
+        with patch(
+            "srtctl.cli.mixins.benchmark_stage.get_hostname_ip",
+            side_effect=lambda node, interface: f"ip-{node}",
+        ):
+            env = stage._get_benchmark_env(CustomBenchmarkRunner())
+
+        assert env["AIPERF_SERVER_METRICS_URLS"] == (
+            "http://ip-node-a:6100/prometheus/metrics,http://ip-node-c:6100/prometheus/metrics"
+        )
+
+    def test_static_router_custom_endpoints_use_the_trtllm_prometheus_path(self):
+        """A router in front of trtllm-serve workers (smg) advertises each worker's
+        own port at the engine's Prometheus route, not the router's /metrics."""
+        from unittest.mock import patch
+
+        from srtctl.benchmarks.custom import CustomBenchmarkRunner
+        from srtctl.core.topology import Process
+
+        processes = [
+            Process("node-a", frozenset(range(8)), 7500, 6100, "agg", 0, node_rank=0),
+            Process("node-b", frozenset(range(8)), 7501, 0, "agg", 0, node_rank=1),
+        ]
+        stage = self._benchmark_stage("smg", processes, backend_type="trtllm")
+
+        with patch(
+            "srtctl.cli.mixins.benchmark_stage.get_hostname_ip",
+            side_effect=lambda node, interface: f"ip-{node}",
+        ):
+            env = stage._get_benchmark_env(CustomBenchmarkRunner())
+
+        assert env["SRT_AGG_ENDPOINTS"] == "ip-node-a:6100"
+        assert env["AIPERF_SERVER_METRICS_URLS"] == "http://ip-node-a:6100/prometheus/metrics"
+
+    @pytest.mark.parametrize("publish_metrics", [False, True])
+    @pytest.mark.parametrize("publish_events_and_metrics", [None, False, True])
+    def test_trtllm_serve_physical_endpoints_use_worker_http_ports(self, publish_metrics, publish_events_and_metrics):
+        """Built-in AIPerf path: trtllm-serve never binds the DYN_SYSTEM_PORT
+        sys-ports, so the physical-process URLs use leader http_ports at
+        /prometheus/metrics. The route exists only when the worker's engine
+        config carries return_perf_metrics (which expand_trtllm_serve_defaults
+        sets on every trtllm_serve recipe), so the gate is that key -- not
+        publish_events_and_metrics, a dynamo.trtllm flag trtllm-serve never sees."""
+        from unittest.mock import patch
+
+        from srtctl.core.topology import Process
+
+        processes = [
+            Process("node-a", frozenset(range(4)), 7500, 6100, "prefill", 0, node_rank=0),
+            Process("node-b", frozenset(range(4)), 7501, 0, "prefill", 0, node_rank=1),
+            Process("node-c", frozenset(range(4)), 7502, 6100, "decode", 0, node_rank=0),
+        ]
+        engine = {"prefill": {"return_perf_metrics": True}, "decode": {"return_perf_metrics": True}}
+        publishing = {
+            "publish_metrics": publish_metrics,
+            "publish_events_and_metrics": publish_events_and_metrics,
+        }
+        stage = self._benchmark_stage(
+            "trtllm_serve", processes, backend_type="trtllm", trtllm_config=engine, **publishing
+        )
+        with patch(
+            "srtctl.cli.mixins.benchmark_stage.get_hostname_ip",
+            side_effect=lambda node, interface: f"ip-{node}",
+        ):
+            env = stage._get_aiperf_server_metrics_env()
+        assert env["AIPERF_SERVER_METRICS_URLS"] == (
+            "http://ip-node-a:6100/prometheus/metrics,http://ip-node-c:6100/prometheus/metrics"
+        )
+
+        # A mode that opted out (return_perf_metrics: false) mounts no route:
+        # only the other mode's leader is advertised -- no dead URLs.
+        engine_partial = {"prefill": {"return_perf_metrics": True}, "decode": {"return_perf_metrics": False}}
+        stage_partial = self._benchmark_stage(
+            "trtllm_serve", processes, backend_type="trtllm", trtllm_config=engine_partial, **publishing
+        )
+        with patch(
+            "srtctl.cli.mixins.benchmark_stage.get_hostname_ip",
+            side_effect=lambda node, interface: f"ip-{node}",
+        ):
+            env = stage_partial._get_aiperf_server_metrics_env()
+        assert env["AIPERF_SERVER_METRICS_URLS"] == "http://ip-node-a:6100/prometheus/metrics"
+
+        # No engine config at all (nothing set the default): nothing to poll, and
+        # Neither Dynamo publishing option may replace the trtllm-serve gate.
+        stage_off = self._benchmark_stage("trtllm_serve", processes, backend_type="trtllm", **publishing)
+        with patch(
+            "srtctl.cli.mixins.benchmark_stage.get_hostname_ip",
+            side_effect=lambda node, interface: f"ip-{node}",
+        ):
+            assert stage_off._get_aiperf_server_metrics_env() == {}
 
     def test_observability_does_not_reach_the_benchmark_client(self):
         """``observability`` configures what the servers emit, not the client.
@@ -410,69 +831,6 @@ class TestCustomBenchmarkRunner:
         assert env["SRT_AGG_ENDPOINTS"] == "ip-node-a:8000"
         assert env["AIPERF_SERVER_METRICS_URLS"] == "http://ip-node-a:8000/metrics"
 
-    def test_raw_scrape_frontend_target_follows_the_public_api_node(self):
-        """The frontend /metrics target must be whoever serves the public port.
-
-        For a single-worker direct-vLLM aggregated job that is the agg leader,
-        not the orchestrator -- scraping the orchestrator would poll a node that
-        is not listening on FRONTEND_PUBLIC_PORT and lose the frontend rows.
-        """
-        from unittest.mock import patch
-
-        from srtctl.core.topology import Process
-
-        processes = [
-            Process("node-a", frozenset(range(4)), 7500, 6100, "agg", 0, node_rank=0),
-            Process("node-b", frozenset(range(4)), 7501, 0, "agg", 0, node_rank=1),
-        ]
-        stage = self._benchmark_stage("vllm", processes)
-        assert stage._orchestrator_node() == "head-node"  # the wrong answer, kept distinct on purpose
-
-        with patch(
-            "srtctl.cli.mixins.benchmark_stage.get_hostname_ip",
-            side_effect=lambda node, interface: f"ip-{node}",
-        ):
-            targets = stage._analytics_scrape_targets()
-
-        frontend = [t for t in targets if t.role == "frontend"]
-        assert len(frontend) == 1
-        assert frontend[0].url == "http://ip-node-a:8000/metrics"
-
-    def test_raw_scrape_worker_targets_are_dynamo_scoped(self, caplog):
-        """Only Dynamo publishes worker /metrics on DYN_SYSTEM_PORT.
-
-        Other frontends get the frontend endpoint and a warning, rather than a
-        list of ports nothing is serving -- a run that looks instrumented but
-        yields no worker rows is the failure mode this knob exists to prevent.
-        """
-        import logging
-        from unittest.mock import patch
-
-        from srtctl.core.topology import Process
-
-        processes = [
-            Process("node-a", frozenset(range(4)), 7500, 6100, "prefill", 0, node_rank=0),
-            Process("node-b", frozenset(range(4)), 7501, 6101, "decode", 0, node_rank=0),
-        ]
-
-        with patch(
-            "srtctl.cli.mixins.benchmark_stage.get_hostname_ip",
-            side_effect=lambda node, interface: f"ip-{node}",
-        ):
-            dynamo = self._benchmark_stage("dynamo", processes)._analytics_scrape_targets()
-            with caplog.at_level(logging.WARNING):
-                sglang = self._benchmark_stage("sglang", processes)._analytics_scrape_targets()
-
-        assert [t.role for t in dynamo] == ["frontend", "prefill", "decode"]
-        assert [t.url for t in dynamo[1:]] == [
-            "http://ip-node-a:7500/metrics",
-            "http://ip-node-b:7501/metrics",
-        ]
-        assert [t.worker_id for t in dynamo[1:]] == ["node-a", "node-b"]
-
-        assert [t.role for t in sglang] == ["frontend"]
-        assert "does not publish worker /metrics" in caplog.text
-
     def test_worker_endpoint_order_keeps_colocated_logical_workers_aligned(self):
         from unittest.mock import patch
 
@@ -516,6 +874,191 @@ class TestCustomBenchmarkRunner:
         assert env["AIPERF_SERVER_METRICS_URLS"] == (
             "http://ip-node-a:7500/metrics,http://ip-node-b:7501/metrics,http://ip-node-c:7502/metrics"
         )
+
+    def test_builtin_aiperf_omits_dead_trtllm_worker_urls(self):
+        """An explicit opt-out of both publishing options omits engine URLs."""
+        from unittest.mock import patch
+
+        from srtctl.benchmarks.trace_replay import TraceReplayRunner
+        from srtctl.core.topology import Process
+
+        processes = [
+            Process("node-a", frozenset(range(4)), 7500, 6100, "prefill", 0, node_rank=0),
+            Process("node-b", frozenset(range(4)), 7501, 0, "decode", 0, node_rank=0),
+        ]
+        stage = self._benchmark_stage(
+            "dynamo",
+            processes,
+            benchmark_type="trace-replay",
+            backend_type="trtllm",
+            publish_metrics=False,
+            publish_events_and_metrics=False,
+        )
+
+        with patch(
+            "srtctl.cli.mixins.benchmark_stage.get_hostname_ip",
+            side_effect=lambda node, interface: f"ip-{node}",
+        ):
+            env = stage._get_benchmark_env(TraceReplayRunner())
+
+        assert "AIPERF_SERVER_METRICS_URLS" not in env
+
+    @pytest.mark.parametrize("benchmark_type", ["trace-replay", "custom"])
+    @pytest.mark.parametrize("mode", ["prefill", "decode", "agg"])
+    @pytest.mark.parametrize(
+        ("publishing", "expected_enabled"),
+        [
+            ({}, True),
+            ({"publish_metrics": False, "publish_events_and_metrics": None}, False),
+            ({"publish_metrics": True, "publish_events_and_metrics": None}, True),
+            ({"publish_metrics": False, "publish_events_and_metrics": False}, False),
+            ({"publish_metrics": True, "publish_events_and_metrics": False}, True),
+            ({"publish_metrics": False, "publish_events_and_metrics": True}, True),
+            ({"publish_metrics": True, "publish_events_and_metrics": True}, True),
+        ],
+    )
+    def test_dynamo_trtllm_metric_urls_follow_publishing_policy(
+        self, benchmark_type, mode, publishing, expected_enabled
+    ):
+        """Both URL paths honor metrics-only, opt-out, and the legacy combined flag."""
+        from unittest.mock import patch
+
+        from srtctl.benchmarks.custom import CustomBenchmarkRunner
+        from srtctl.benchmarks.trace_replay import TraceReplayRunner
+        from srtctl.core.topology import Process
+
+        processes = [
+            Process("node-a", frozenset(range(4)), 7500, 6100, mode, 0, node_rank=0),
+            Process("node-b", frozenset(range(4)), 7501, 0, mode, 0, node_rank=1),
+        ]
+        stage = self._benchmark_stage(
+            "dynamo",
+            processes,
+            benchmark_type=benchmark_type,
+            backend_type="trtllm",
+            **publishing,
+        )
+        runner = CustomBenchmarkRunner() if benchmark_type == "custom" else TraceReplayRunner()
+
+        with patch(
+            "srtctl.cli.mixins.benchmark_stage.get_hostname_ip",
+            side_effect=lambda node, interface: f"ip-{node}",
+        ):
+            env = stage._get_benchmark_env(runner)
+
+        if expected_enabled:
+            expected = "http://ip-node-a:7500/metrics"
+            if benchmark_type != "custom":
+                expected += ",http://ip-node-b:7501/metrics"
+            assert env["AIPERF_SERVER_METRICS_URLS"] == expected
+        else:
+            assert "AIPERF_SERVER_METRICS_URLS" not in env
+        if benchmark_type == "custom":
+            # Disabling metric URLs must not remove routable worker topology.
+            assert env[f"SRT_{mode.upper()}_ENDPOINTS"] == "ip-node-a:7500"
+
+    @pytest.mark.parametrize("benchmark_type", ["trace-replay", "custom"])
+    def test_dead_trtllm_worker_urls_still_advertise_kvbm(self, benchmark_type):
+        """KVBM serves its own /metrics independently of the publish flag,
+        so its endpoints survive the dead-worker-URL omission."""
+        from unittest.mock import patch
+
+        from srtctl.benchmarks.custom import CustomBenchmarkRunner
+        from srtctl.benchmarks.trace_replay import TraceReplayRunner
+        from srtctl.core.topology import Process
+
+        processes = [
+            Process("node-a", frozenset(range(4)), 7500, 6100, "prefill", 0, node_rank=0),
+            Process("node-b", frozenset(range(4)), 7501, 0, "decode", 0, node_rank=0),
+        ]
+        stage = self._benchmark_stage(
+            "dynamo",
+            processes,
+            benchmark_type=benchmark_type,
+            backend_type="trtllm",
+            publish_metrics=False,
+            publish_events_and_metrics=False,
+            prefill_environment={"DYN_KVBM_METRICS_PORT": "9345"},
+        )
+
+        with patch(
+            "srtctl.cli.mixins.benchmark_stage.get_hostname_ip",
+            side_effect=lambda node, interface: f"ip-{node}",
+        ):
+            runner = CustomBenchmarkRunner() if benchmark_type == "custom" else TraceReplayRunner()
+            env = stage._get_benchmark_env(runner)
+
+        assert env["AIPERF_SERVER_METRICS_URLS"] == "http://ip-node-a:9345/metrics"
+
+    @pytest.mark.parametrize("benchmark_type", ["trace-replay", "custom"])
+    @pytest.mark.parametrize("publish_metrics", [False, True])
+    @pytest.mark.parametrize("publish_events_and_metrics", [None, False, True])
+    def test_sidecar_metric_urls_ignore_standalone_publishing_option(
+        self, benchmark_type, publish_metrics, publish_events_and_metrics
+    ):
+        """The standalone dynamo.trtllm flag does not change existing sidecar URLs."""
+        from unittest.mock import patch
+
+        from srtctl.benchmarks.custom import CustomBenchmarkRunner
+        from srtctl.benchmarks.trace_replay import TraceReplayRunner
+        from srtctl.core.topology import Process
+
+        processes = [Process("node-a", frozenset(range(4)), 7500, 6100, "agg", 0, node_rank=0)]
+        stage = self._benchmark_stage(
+            "dynamo",
+            processes,
+            benchmark_type=benchmark_type,
+            backend_type="trtllm",
+            dynamo_sidecar=True,
+            publish_metrics=publish_metrics,
+            publish_events_and_metrics=publish_events_and_metrics,
+        )
+        runner = CustomBenchmarkRunner() if benchmark_type == "custom" else TraceReplayRunner()
+
+        with patch(
+            "srtctl.cli.mixins.benchmark_stage.get_hostname_ip",
+            side_effect=lambda node, interface: f"ip-{node}",
+        ):
+            env = stage._get_benchmark_env(runner)
+
+        if benchmark_type == "custom":
+            assert env["AIPERF_SERVER_METRICS_URLS"] == "http://ip-node-a:6100/metrics"
+        elif publish_events_and_metrics:
+            assert env["AIPERF_SERVER_METRICS_URLS"] == "http://ip-node-a:7500/metrics"
+        else:
+            assert "AIPERF_SERVER_METRICS_URLS" not in env
+
+    @pytest.mark.parametrize("benchmark_type", ["trace-replay", "custom"])
+    def test_explicit_server_metrics_urls_env_wins(self, benchmark_type):
+        """An operator-supplied AIPERF_SERVER_METRICS_URLS in the recipe
+        environment is respected verbatim, never clobbered by injection."""
+        from unittest.mock import patch
+
+        from srtctl.benchmarks.custom import CustomBenchmarkRunner
+        from srtctl.benchmarks.trace_replay import TraceReplayRunner
+        from srtctl.core.topology import Process
+
+        processes = [
+            Process("node-a", frozenset(range(4)), 7500, 6100, "prefill", 0, node_rank=0),
+        ]
+        stage = self._benchmark_stage(
+            "dynamo",
+            processes,
+            benchmark_type=benchmark_type,
+            backend_type="trtllm",
+            publish_metrics=False,
+            publish_events_and_metrics=False,
+            environment={"AIPERF_SERVER_METRICS_URLS": "http://curated:9999/metrics"},
+        )
+
+        with patch(
+            "srtctl.cli.mixins.benchmark_stage.get_hostname_ip",
+            side_effect=lambda node, interface: f"ip-{node}",
+        ):
+            runner = CustomBenchmarkRunner() if benchmark_type == "custom" else TraceReplayRunner()
+            env = stage._get_benchmark_env(runner)
+
+        assert env["AIPERF_SERVER_METRICS_URLS"] == "http://curated:9999/metrics"
 
 
 class TestSGLangBenchRunner:
@@ -847,6 +1390,7 @@ class TestTraceReplayRunner:
         from srtctl.core.schema import SrtConfig
 
         config_data = {
+            "schema": 2,
             "name": "trace-test",
             "model": {"path": "/model", "container": "/image", "precision": "fp4"},
             "resources": {"gpu_type": "gb200"},
@@ -869,6 +1413,143 @@ class TestTraceReplayRunner:
         assert config.benchmark.concurrencies == [4, 8]
         assert config.benchmark.ttft_threshold_ms == 3000
         assert config.benchmark.itl_threshold_ms == 7
+
+
+class TestAgentPerfRunner:
+    """Test AgentPerf benchmark runner."""
+
+    def _config(self, **benchmark_kwargs):
+        from srtctl.core.schema import BenchmarkConfig, ModelConfig, ResourceConfig, SrtConfig
+
+        return SrtConfig(
+            name="test",
+            model=ModelConfig(path="/model/dsv4", container="/image", precision="fp4"),
+            resources=ResourceConfig(gpu_type="gb300"),
+            benchmark=BenchmarkConfig(type="agentperf", **benchmark_kwargs),
+        )
+
+    def test_in_registry(self):
+        """agentperf is registered in benchmark list."""
+        assert "agentperf" in list_benchmarks()
+
+    def test_get_runner(self):
+        """Can get runner for agentperf."""
+        runner = get_runner("agentperf")
+        assert runner.name == "AgentPerf"
+        assert "agentperf" in runner.script_path
+
+    def test_validate_missing_client_dir(self):
+        """Validates that agentperf_client_dir is required."""
+        runner = get_runner("agentperf")
+        errors = runner.validate_config(self._config(agentperf_config="/workload/agentperf.yaml", concurrency=1010))
+        assert any("agentperf_client_dir" in e for e in errors)
+
+    def test_validate_missing_config(self):
+        """Validates that agentperf_config is required."""
+        runner = get_runner("agentperf")
+        errors = runner.validate_config(self._config(agentperf_client_dir="/agentperf-client", concurrency=1010))
+        assert any("agentperf_config" in e for e in errors)
+
+    def test_validate_missing_concurrency(self):
+        """Validates that a concurrency is required."""
+        runner = get_runner("agentperf")
+        errors = runner.validate_config(
+            self._config(agentperf_client_dir="/agentperf-client", agentperf_config="/workload/agentperf.yaml")
+        )
+        assert any("concurrency" in e for e in errors)
+
+    def test_validate_rejects_empty_concurrencies(self):
+        """An empty concurrencies list must not silently defer to the workload YAML."""
+        runner = get_runner("agentperf")
+        errors = runner.validate_config(
+            self._config(
+                agentperf_client_dir="/agentperf-client",
+                agentperf_config="/workload/agentperf.yaml",
+                concurrencies=[],
+            )
+        )
+        assert any("at least one concurrency" in e for e in errors)
+
+    def test_validate_rejects_nonpositive_concurrency(self):
+        """Zero or negative concurrencies are rejected."""
+        runner = get_runner("agentperf")
+        errors = runner.validate_config(
+            self._config(
+                agentperf_client_dir="/agentperf-client",
+                agentperf_config="/workload/agentperf.yaml",
+                concurrencies=[0, 8],
+            )
+        )
+        assert any("positive" in e for e in errors)
+
+    def test_validate_valid(self):
+        """Valid config passes validation."""
+        runner = get_runner("agentperf")
+        errors = runner.validate_config(
+            self._config(
+                agentperf_client_dir="/agentperf-client",
+                agentperf_config="/workload/agentperf.yaml",
+                concurrencies=[64, 1010],
+            )
+        )
+        assert errors == []
+
+    def test_build_command(self):
+        """Build command carries endpoint, model, client dir, config and concurrencies."""
+        from unittest.mock import MagicMock
+
+        runner = get_runner("agentperf")
+        runtime = MagicMock()
+        runtime.frontend_port = 8000
+        config = self._config(
+            agentperf_client_dir="/agentperf-client",
+            agentperf_config="/workload/agentperf.yaml",
+            concurrencies=[64, 1010],
+        )
+        cmd = runner.build_command(config, runtime)
+        assert cmd[0] == "bash"
+        assert cmd[1] == "/srtctl-benchmarks/agentperf/bench.sh"
+        assert cmd[2] == "http://localhost:8000"
+        # served_model_name derives the basename; the client must use the name
+        # the frontend actually serves.
+        assert cmd[3] == "dsv4"
+        assert cmd[4] == "/agentperf-client"
+        assert cmd[5] == "/workload/agentperf.yaml"
+        assert cmd[6] == "64,1010"
+
+    def test_build_command_single_concurrency(self):
+        """benchmark.concurrency (singular) wins over concurrencies."""
+        from unittest.mock import MagicMock
+
+        runner = get_runner("agentperf")
+        runtime = MagicMock()
+        runtime.frontend_port = 8000
+        config = self._config(
+            agentperf_client_dir="/agentperf-client",
+            agentperf_config="/workload/agentperf.yaml",
+            concurrency=1010,
+        )
+        cmd = runner.build_command(config, runtime)
+        assert cmd[6] == "1010"
+
+    def test_script_exists(self):
+        """agentperf bench.sh and rollup.py ship with the package."""
+        assert (SCRIPTS_DIR / "agentperf" / "bench.sh").exists()
+        assert (SCRIPTS_DIR / "agentperf" / "rollup.py").exists()
+
+    def test_environment_passthrough(self):
+        """benchmark.env reaches the client environment."""
+        from unittest.mock import MagicMock
+
+        runner = get_runner("agentperf")
+        config = self._config(
+            agentperf_client_dir="/agentperf-client",
+            agentperf_config="/workload/agentperf.yaml",
+            concurrency=8,
+            env={"AGENTPERF_EXTRA_ARGS": "--seed 100 --no-eval"},
+        )
+        env = runner.get_environment(config, MagicMock())
+        assert env["AGENTPERF_EXTRA_ARGS"] == "--seed 100 --no-eval"
 
 
 class TestLMEvalRunner:
@@ -933,7 +1614,7 @@ class TestGSM8KRunner:
     def _sglang_config(self, **benchmark_kwargs):
         from srtctl.core.schema import BenchmarkConfig, ModelConfig, ResourceConfig, SrtConfig
 
-        # Default backend is SGLangProtocol.
+        # Default backend is SGLangBackend.
         return SrtConfig(
             name="test",
             model=ModelConfig(path="/model", container="/image", precision="fp4"),
@@ -942,14 +1623,15 @@ class TestGSM8KRunner:
         )
 
     def _vllm_config(self, served_model_name="Qwen3.5-397B-A17B-NVFP4", **benchmark_kwargs):
-        from srtctl.backends.vllm import VLLMProtocol, VLLMServerConfig
-        from srtctl.core.schema import BenchmarkConfig, ModelConfig, ResourceConfig, SrtConfig
+        from srtctl.backends.vllm import VLLMBackend
+        from srtctl.core.schema import BenchmarkConfig, ModelConfig, ResourceConfig, SrtConfig, RoleConfig
 
         return SrtConfig(
             name="test",
             model=ModelConfig(path="/model", container="/image", precision="fp4"),
             resources=ResourceConfig(gpu_type="gb200"),
-            backend=VLLMProtocol(vllm_config=VLLMServerConfig(decode={"served-model-name": served_model_name})),
+            engine=VLLMBackend(),
+            roles={"decode": RoleConfig(args={"served-model-name": served_model_name})},
             benchmark=BenchmarkConfig(type="gsm8k", **benchmark_kwargs),
         )
 
@@ -1246,6 +1928,7 @@ class TestCustomDatasetLoader:
         from srtctl.core.schema import SrtConfig
 
         config_data = {
+            "schema": 2,
             "name": "custom-dataset-test",
             "model": {"path": "/model", "container": "/image", "precision": "fp4"},
             "resources": {"gpu_type": "h100"},
@@ -1277,26 +1960,28 @@ class TestRunPostEval:
 
         from srtctl.cli.do_sweep import SweepOrchestrator
         from srtctl.core.runtime import Nodes, RuntimeContext
+        from srtctl.services.config import ServiceConfig
         from srtctl.core.schema import (
             BenchmarkConfig,
             FrontendConfig,
             HealthCheckConfig,
             ModelConfig,
+            ObservabilityConfig,
             ResourceConfig,
+            RoleConfig,
             SrtConfig,
+            TachometerConfig,
         )
 
         config = SrtConfig(
             name="test",
             model=ModelConfig(path="/model/test-model", container="/image", precision="fp4"),
-            resources=ResourceConfig(
-                gpu_type="h100",
-                gpus_per_node=8,
-                prefill_nodes=1,
-                decode_nodes=2,
-                prefill_workers=1,
-                decode_workers=2,
-            ),
+            # These tests exercise the eval flow, not telemetry; opt out of the
+            # default-on Tachometer so run() needs no scraper mocks.
+            observability=ObservabilityConfig(tachometer=TachometerConfig(enabled=False)),
+            services=[ServiceConfig(name="otel-collector", type="otel-collector", enabled=False)],
+            resources=ResourceConfig(gpu_type="h100", gpus_per_node=8),
+            roles={"prefill": RoleConfig(nodes=1, workers=1), "decode": RoleConfig(nodes=2, workers=2)},
             benchmark=BenchmarkConfig(type="sa-bench", isl=1024, osl=1024, concurrencies="128x256x512"),
             health_check=HealthCheckConfig(max_attempts=3, interval_seconds=1),
             frontend=FrontendConfig(type="dynamo"),
@@ -1339,7 +2024,7 @@ class TestRunPostEval:
         orch = self._make_orchestrator()
         stop = threading.Event()
         with patch.dict(os.environ, {"EVAL_ONLY": "true"}, clear=False):
-            with patch("srtctl.core.health.wait_for_model", return_value=False):
+            with patch.object(orch, "_wait_for_service_ready", return_value=False):
                 result = orch._run_post_eval(stop)
         assert result == 1
 
@@ -1390,7 +2075,7 @@ class TestRunPostEval:
         mock_proc.returncode = 0
 
         with patch.dict(os.environ, {"EVAL_ONLY": "true"}, clear=False):
-            with patch("srtctl.core.health.wait_for_model", return_value=True):
+            with patch.object(orch, "_wait_for_service_ready", return_value=True):
                 with patch("srtctl.cli.do_sweep.start_srun_process", return_value=mock_proc):
                     result = orch._run_post_eval(stop)
         assert result == 0

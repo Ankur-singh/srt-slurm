@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from srtctl.core.runtime import RuntimeContext
@@ -18,8 +18,64 @@ if TYPE_CHECKING:
 SCRIPTS_DIR = Path(__file__).parent / "scripts"
 
 
+@runtime_checkable
+class PrewarmPlan(Protocol):
+    """Work a benchmark can do before its job is submitted.
+
+    ``srtctl cache-inputs`` displays and runs a plan without knowing which
+    benchmark produced it, so everything it shows the user comes from here.
+    """
+
+    @property
+    def title(self) -> str:
+        """Heading for the plan summary."""
+        ...
+
+    @property
+    def summary_rows(self) -> tuple[tuple[str, str], ...]:
+        """Label/value pairs describing what the plan would build."""
+        ...
+
+    @property
+    def done_message(self) -> str:
+        """Reported once the plan has run successfully."""
+        ...
+
+    def srun_command(self) -> list[str]:
+        """The command that does the work, ready to display or execute."""
+        ...
+
+    def run(self) -> int:
+        """Do the work and return its exit code."""
+        ...
+
+
+# BenchmarkConfig fields every type may set: where the client runs, sweeps, aiperf
+# plumbing, and post-processing. Everything else belongs to specific runners.
+# ``concurrencies`` is shared because power telemetry (``telemetry.enabled``)
+# derives its expected measurement windows from it for every benchmark type,
+# including ``custom`` clients that read the value from their own env.
+SHARED_BENCHMARK_FIELDS: frozenset[str] = frozenset(
+    {
+        "type",
+        "stream_output",
+        "placement",
+        "colocate_with_frontend",
+        "sweep",
+        "aiperf_package",
+        "aiperf_args",
+        "concurrencies",
+    }
+)
+
+
 class BenchmarkRunner(ABC):
     """Abstract base class that all benchmark runners must inherit."""
+
+    # BenchmarkConfig fields this runner reads, beyond SHARED_BENCHMARK_FIELDS. A
+    # recipe that sets a field outside shared + these for its type is rejected
+    # at load, see SrtConfig._validate_benchmark_type.
+    config_fields: ClassVar[frozenset[str]] = frozenset()
 
     @property
     @abstractmethod
@@ -71,6 +127,22 @@ class BenchmarkRunner(ABC):
         """Get benchmark-specific environment variables."""
         return {}
 
+    def plan_prewarm(
+        self,
+        config: SrtConfig,
+        *,
+        account: str | None = None,
+        partition: str | None = None,
+        time_limit: str | None = None,
+        num_workers: int | None = None,
+    ) -> PrewarmPlan | None:
+        """Plan work this benchmark can do before its job is submitted.
+
+        None means the benchmark has nothing to build ahead of time. Raise
+        ValueError when it could, but the recipe is missing a field to do it.
+        """
+        return None
+
 
 class AIPerfBenchmarkRunner(BenchmarkRunner):
     """Base class for AIPerf-driven benchmarks.
@@ -107,6 +179,17 @@ def register_benchmark(name: str):
         return cls
 
     return decorator
+
+
+def get_runner_class(benchmark_type: str) -> type[BenchmarkRunner] | None:
+    """The registered runner class for ``benchmark_type``, or None (``manual`` has no runner)."""
+    return _BENCHMARK_RUNNERS.get(benchmark_type)
+
+
+def benchmark_config_fields(benchmark_type: str) -> frozenset[str]:
+    """Every BenchmarkConfig field a recipe of this type may set: shared plus the runner's own."""
+    runner = _BENCHMARK_RUNNERS.get(benchmark_type)
+    return SHARED_BENCHMARK_FIELDS | (runner.config_fields if runner is not None else frozenset())
 
 
 def get_runner(benchmark_type: str) -> BenchmarkRunner:

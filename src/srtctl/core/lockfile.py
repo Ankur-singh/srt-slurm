@@ -35,6 +35,7 @@ import yaml
 
 from srtctl.core.fingerprint import load_fingerprint
 from srtctl.core.resource_snapshot import load_resource_snapshot
+from srtctl.core.supervisor import load_worker_restarts
 
 if TYPE_CHECKING:
     from srtctl.core.schema import SrtConfig
@@ -43,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 # Lockfile format version — bump when the structure changes
 _LOCKFILE_VERSION = 2
+LOCKFILE_VERSION = _LOCKFILE_VERSION  # public alias for srtctl.version
 
 # Comment inserted above the lock section
 _LOCK_COMMENT = """\
@@ -96,6 +98,11 @@ def collect_slurm_context() -> dict[str, Any]:
     srtctl_root = os.environ.get("SRTCTL_ROOT")
     if srtctl_root:
         ctx["srtctl_root"] = srtctl_root
+
+    with contextlib.suppress(Exception):
+        from srtctl.version import package_version
+
+        ctx["srtctl_version"] = package_version()
 
     with contextlib.suppress(Exception):
         import subprocess
@@ -200,6 +207,9 @@ def build_lock_section(
         lock["fingerprints"] = worker_fingerprints
     if resolved_log_dir and (resource_snapshot := load_resource_snapshot(resolved_log_dir)):
         lock["resource_snapshot"] = resource_snapshot
+    # A result produced through worker relaunches is a different result; say so.
+    if resolved_log_dir and (worker_restarts := load_worker_restarts(resolved_log_dir)):
+        lock["worker_restarts"] = worker_restarts
     if results:
         lock["results"] = results
 
@@ -229,9 +239,13 @@ def write_lockfile(
             # Strip any existing lock: section (from re-runs of lockfiles)
             recipe_text = _strip_lock_section(recipe_text)
         else:
-            # Fallback: serialize the config (loses comments/formatting)
+            # Fallback: serialize the config. The dump is the recipe layout with every
+            # default and cluster value baked in, so it resubmits, but it loses the
+            # recipe's comments. `srtctl apply` always copies the recipe to config.yaml,
+            # so only a hand-submitted job lands here.
             from srtctl.core.schema import SrtConfig
 
+            logger.warning("%s not found; the lockfile embeds the resolved config instead of the recipe", recipe_path)
             config_dict = SrtConfig.Schema().dump(config)
             config_dict.pop("lock", None)
             recipe_text = yaml.dump(config_dict, default_flow_style=False, sort_keys=False)

@@ -1,17 +1,12 @@
 # Introduction
 
-`srtctl` is a command-line tool for running distributed LLM inference benchmarks on SLURM clusters. It replaces complex shell scripts and 50+ CLI flags with clean, declarative YAML configuration files.
+`srtctl` is a command-line tool for running distributed LLM inference benchmarks on SLURM clusters. It replaces complex shell scripts and 50+ CLI flags with one declarative `schema: 2` YAML recipe: `engine:` names the inference engine (SGLang, vLLM, TRT-LLM, TileRT, ATOM), `roles:` describes each worker role (prefill, decode, agg) with its node and GPU counts, `env`, and `args`, `frontend:` picks the router, `benchmark:` the load, and `services:` anything else launched next to the job.
 
-## Table of Contents
-
-- [Why srtctl?](#why-srtctl)
-- [How It Works](#how-it-works)
-- [Commands](#commands)
-- [Next Steps](#next-steps)
+New here: [Installation](installation.md) sets up a checkout and submits a first job.
 
 ## Why srtctl?
 
-Running large language models across multiple GPUs and nodes requires orchestrating many moving parts: SLURM job scripts, container mounts, SGLang configuration, worker coordination, and benchmark execution. Traditionally, this meant maintaining brittle bash scripts with hardcoded parameters.
+Running large language models across multiple GPUs and nodes requires orchestrating many moving parts: SLURM job scripts, container mounts, engine configuration, worker coordination, and benchmark execution. Traditionally, this meant maintaining brittle bash scripts with hardcoded parameters.
 
 `srtctl` solves this by providing:
 
@@ -25,35 +20,25 @@ Running large language models across multiple GPUs and nodes requires orchestrat
 
 When you run `srtctl apply -f config.yaml`, the tool:
 
-1. Validates your configuration against the schema
-2. Resolves any aliases from your cluster config (`srtslurm.yaml`)
-3. Generates a SLURM batch script and SGLang configuration files
+1. Resolves aliases from your cluster config (`srtslurm.yaml`) and normalizes `engine:`, `roles:`, `placement:`, and `services:` into the internal config
+2. Validates the result against the schema (a colocated decode split that does not fit, a benchmark field the type does not use, and a moving `dynamo.source.rev` are all rejected here)
+3. Generates a SLURM batch script and the per-role engine configuration
 4. Submits to SLURM
 
-The `srtctl-mcp` server is different from `srtctl apply`: it is a schema and
-recipe-authoring helper. It does not use host-side `srtslurm.yaml` for cluster
-defaults, aliases, containers, model paths, filesystem checks, or dry-run
-behavior. Run `srtctl` on the compute side, or use an orchestrator remote
-preflight path, for those checks.
+Once allocated, workers launch inside containers, discover each other through etcd (NATS only when a recipe selects a NATS request or event plane), and begin serving. If you've configured a benchmark, it runs automatically against the serving endpoint and saves results to the log directory.
 
-Once allocated, workers launch inside containers, discover each other through ETCD and NATS, and begin serving. If you've configured a benchmark, it runs automatically against the serving endpoint and saves results to the log directory.
+## How these docs are organized
 
-## Commands
+- **Get Started**: installation, `srtslurm.yaml`, and the CLI workflows.
+- **Write a Recipe**: the [Recipe Guide](config-reference.md) and one page per recipe block. These pages explain behavior, how blocks interact, and worked examples.
+- **Run and Operate** and **Analyze**: monitoring, troubleshooting, profiling, telemetry, and trace tools.
+- **Reference**: generated from the code, so it is never stale. [Schema Reference](schema-reference.md) lists every field with its type, default, and allowed values; [CLI Reference](cli-reference.md) lists every command and flag.
 
-| Command                                            | Description                             |
-| -------------------------------------------------- | --------------------------------------- |
-| `srtctl apply -f <config>`                         | Submit job(s) to SLURM                  |
-| `srtctl apply -f <config> --setup-script <script>` | Submit with custom setup script         |
-| `srtctl apply -f <config> --tags tag1,tag2`        | Submit with tags for filtering          |
-| `srtctl dry-run -f <config>`                       | Validate and preview without submitting |
-| `srtctl validate -f <config>`                      | Alias for dry-run                       |
+When a guide page and a generated page disagree about a field, the generated page is right.
 
-## Next Steps
+## For agents and editors
 
-- [Installation](installation.md) - Set up `srtctl` and submit your first job
-- [Monitoring](monitoring.md) - Understanding job logs and debugging
-- [Parameter Sweeps](sweeps.md) - Run grid searches across configurations
-- [Config Overrides](overrides.md) - Multi-variant jobs from a single file
-- [Profiling](profiling.md) - Performance analysis with torch/nsys
-- [Analyzing Results](analyzing.md) - Dashboard and visualization
-- [SGLang Router](sglang-router.md) - Alternative to Dynamo for PD disaggregation
+- **llms.txt**: [`llms.txt`](https://nvidia.github.io/srt-slurm/llms.txt) lists every page on this site with a one-line summary; it is rebuilt with the site.
+- **JSON Schema**: [`schema/recipe.schema.json`](https://nvidia.github.io/srt-slurm/schema/recipe.schema.json) (recipes and override files) and [`schema/cluster.schema.json`](https://nvidia.github.io/srt-slurm/schema/cluster.schema.json) (`srtslurm.yaml`), the same output as `srtctl schema [--cluster]`. Put `# yaml-language-server: $schema=https://nvidia.github.io/srt-slurm/schema/recipe.schema.json` on a recipe's first line for live validation in editors. It checks shape only; `srtctl dry-run` checks cross-field rules.
+- **Agent skill**: `srtctl skill --target claude|codex|cursor` installs the in-package skill (how to author, validate, submit, and read back a run) into a project.
+- **MCP server**: `srtctl-mcp` has two halves. The schema tools (`schema_summary`, `explain_field`, `validate_config`, `preflight_config`, `resolve_config`, `get_config_reference`) are recipe-authoring helpers that work anywhere and never read host-side `srtslurm.yaml`. `schema_summary` and `explain_field` answer from the schema dataclasses (the same data as the Schema Reference), with prose from the Write a Recipe pages added as context. The job tools (`submit_job`, `dry_run`, `job_status`, `job_logs`, `list_jobs`, `cancel_job`) drive `srtctl apply`, `sacct`, `squeue`, and `scancel` and read the job's output directory, so they only do anything when the server runs on a login node of the cluster, inside the checkout that has its `srtslurm.yaml`.

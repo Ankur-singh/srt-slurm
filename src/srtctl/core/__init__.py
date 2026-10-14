@@ -18,11 +18,10 @@ This package contains:
 
 # Re-export backend configs
 from srtctl.backends import (
+    Backend,
     BackendConfig,
-    BackendProtocol,
     BackendType,
-    SGLangProtocol,
-    SGLangServerConfig,
+    SGLangBackend,
 )
 
 from .config import (
@@ -34,9 +33,10 @@ from .formatting import FormattablePath, FormattableString
 from .health import (
     WorkerHealthResult,
     check_dynamo_health,
-    check_sglang_router_health,
+    check_static_router_health,
     wait_for_etcd,
     wait_for_health,
+    wait_for_http_endpoints,
     wait_for_model,
     wait_for_port,
 )
@@ -61,8 +61,10 @@ from .schema import (
     ProfilingConfig,
     ProfilingPhaseConfig,
     ResourceConfig,
+    RoleConfig,
     SlurmConfig,
     SrtConfig,
+    Topology,
 )
 from .slurm import (
     get_container_mounts_str,
@@ -84,8 +86,8 @@ from .topology import (
 __all__ = [
     "DEFAULT_AI_ANALYSIS_PROMPT",
     "AIAnalysisConfig",
+    "Backend",
     "BackendConfig",
-    "BackendProtocol",
     "BackendType",
     "BenchmarkConfig",
     "ClusterConfig",
@@ -109,17 +111,18 @@ __all__ = [
     "ProfilingConfig",
     "ProfilingPhaseConfig",
     "ResourceConfig",
+    "RoleConfig",
     "RuntimeContext",
     # Backend configs (re-exported from backends)
-    "SGLangProtocol",
-    "SGLangServerConfig",
+    "SGLangBackend",
     "SlurmConfig",
     # Schema types (frozen dataclasses)
     "SrtConfig",
+    "Topology",
     "WorkerHealthResult",
     "allocate_endpoints",
     "check_dynamo_health",
-    "check_sglang_router_health",
+    "check_static_router_health",
     "endpoints_to_processes",
     "find_cluster_config_path",
     "get_container_mounts_str",
@@ -140,6 +143,7 @@ __all__ = [
     "start_srun_process",
     "wait_for_etcd",
     "wait_for_health",
+    "wait_for_http_endpoints",
     "wait_for_model",
     # Health checks
     "wait_for_port",

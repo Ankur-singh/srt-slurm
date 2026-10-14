@@ -35,6 +35,7 @@ from srtctl.benchmarks.base import SCRIPTS_DIR
 from srtctl.core.config import get_srtslurm_setting
 from srtctl.core.schema import DynamoConfig
 from srtctl.core.slurm import CONTAINER_REMAP_ROOT_EXPORT, get_slurm_job_id, start_srun_process
+from srtctl.core.source import DynamoSourceConfig
 
 MANIFEST_VERSION = 1
 
@@ -348,7 +349,8 @@ class BakePlan:
         if self.dynamo_version:
             # serialize=False: a single task, and the flock sentinel would be
             # captured in the image and make later jobs skip their own install.
-            steps.append(DynamoConfig(version=self.dynamo_version).get_install_commands(serialize=False))
+            dynamo = DynamoConfig(source=DynamoSourceConfig(pypi=self.dynamo_version))
+            steps.append(dynamo.get_install_commands(serialize=False))
             steps.append(f"pip show ai-dynamo >/dev/null && echo 'bake-image: ai-dynamo {self.dynamo_version} present'")
 
         if self.sa_bench:
