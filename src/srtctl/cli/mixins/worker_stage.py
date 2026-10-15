@@ -510,6 +510,7 @@ class WorkerStageMixin:
             signal_full=not automatic_nsys,
             step_name=step_name,
             fatal_log_patterns=self._fatal_log_patterns(mode),
+            worker_assignments=(process,),
         )
 
     def start_endpoint_worker(self, endpoint_processes: list["Process"], *, attempt: int = 0) -> ManagedProcess:
@@ -766,6 +767,7 @@ class WorkerStageMixin:
             signal_full=not automatic_nsys,
             step_name=step_name,
             fatal_log_patterns=self._fatal_log_patterns(mode),
+            worker_assignments=tuple(endpoint_processes),
         )
 
     def _wait_for_worker_ready(self, leader: "Process") -> None:
