@@ -165,56 +165,108 @@ The exporter binary itself decides ACPI vs. DCGM per its own `--source` flag:
   and exit non-zero instead of stepping down. The Python host collector
   (`srtctl.core.cpu_power`) implements the same ladder.
 
-The exporter resolves this once at process startup and serves only one metric
-family (`cpu_power_dcgm_watts` or `cpu_power_acpi_watts`) for its lifetime.
-Client-side parsing (`src/srtctl/core/power/cpu_parser.py`) prefers ACPI
-readings if a scrape body ever contained both, since ACPI carries more detail.
+The exporter resolves this once at process startup and serves only one base
+metric family (`cpu_power_dcgm_watts` or `cpu_power_acpi_watts`) for its
+lifetime. Client-side parsing (`src/srtctl/core/power/cpu_parser.py`) prefers
+ACPI readings if a scrape body ever contained both, since ACPI carries more
+detail.
+
+In both modes the exporter also serves superchip module power from NVML:
+
+```
+cpu_power_nvml_watts{type="module",socket="0",gpus="0,1",source="nvml"} 498.720000
+```
+
+The reading is NVML field 185 (`NVML_FI_DEV_POWER_AVERAGE`, a 1 s average)
+at `NVML_POWER_SCOPE_MODULE`, the value `nvidia-smi` prints as
+`module.power.draw.average`. The instant field is not read, so the series
+never mixes averaging windows. NVIDIA's [Grace Performance Tuning Guide,
+Power and Thermals](https://docs.nvidia.com/grace-perf-tuning-guide/power-thermals.html)
+lists "Module Power" for the Grace Hopper and Grace Blackwell superchips as
+"Total power of the CG1 module, including DRAM power and regulator loss. This
+also includes GPU and GPU HBM Power", reported through `nvidia-smi` from
+release 570. CG1 names the one-GPU Grace Hopper module. The page does not
+say what the meter covers on a two-GPU GB200 module, so that part is
+measured below. On GB200 each GPU of a module reports the whole module, not
+its own share:
+
+```
+module_w = Grace + GPU_a + GPU_b + the rest of the module
+```
+
+The exporter therefore publishes the mean of a socket's GPU readings, one
+sample per socket. To avoid hiding disagreement in that mean, it withholds
+a socket when its GPU readings differ by more than 5% of their mean. It
+warns once when that starts and logs recovery at INFO when they agree again.
+
+NVML initialization and reads run in a background thread, so blocked NVML
+calls do not delay the HTTP server. The module series is omitted until a
+reading is ready; snapshots older than 3 s are withheld. An independent
+timer warns once if initialization takes longer than 3 s or readings become
+missing or stale, and logs recovery at INFO when fresh readings return.
+These messages do not depend on scrapes.
+
+Measured on a GB200 node (driver 580.126.20, kernel 6.8.0-1046-nvidia-64k)
+with an FMA kernel drawing about 400 W per loaded GPU, sampling
+`nvidia-smi --query-gpu=power.draw.average,module.power.draw.average` and
+the ACPI `Grace Power Socket 0` meter together at 1 Hz, 30 to 35 samples per
+row:
+
+| Load         | GPU0 / GPU1 `power.draw` (W) | GPU0 / GPU1 `module.power.draw` (W) | Grace socket 0 (W) |
+| ------------ | ---------------------------- | ----------------------------------- | ------------------ |
+| idle         | 204 / 198                    | 539 / 534                           | 96                 |
+| GPU0 only    | 390 / 202                    | 731 / 725                           | 98                 |
+| GPU0 + GPU1  | 397 / 400                    | 938 / 933                           | 101                |
+
+With only GPU0 loaded, GPU1's own module reading rose 191 W while its chip
+reading did not move, and the gap between the two module readings stayed at
+6 W, the same as at idle. A meter reporting each GPU's share would have left
+GPU1's reading at idle. The two readings of one module differed by at most
+1.1% in a steady phase and 1.9% while load fell. The residual
+`module - Grace - GPU_a - GPU_b` held at 38 to 42 W per socket under every
+load. The page's regulator-loss and HBM terms are candidates for it, but the
+probe did not attribute it.
+
+GPUs are mapped to sockets by the NUMA node of their PCI device, taken as the
+ACPI socket number. On GB200 that was tested by loading the CPUs of one NUMA
+node at a time: NUMA node 1 (CPUs 72 to 143) raised `CPU Power Socket 1`
+from 41 W to 203 W and left socket 0 flat, and NUMA node 0 did the reverse.
+GPUs 0 and 1 sit on NUMA node 0, GPUs 2 and 3 on node 1. GB300 is
+unverified. The collector writes `module_w` only onto a socket row the CPU
+family produced, so the exporter warns once at startup for a module socket
+with no CPU socket.
+
+The series is best-effort. When NVML is unavailable the exporter logs the
+reason at INFO and omits the series; `module_w` stays blank. NVML is the only
+source of `module_w`. A firmware `Module Power Socket N` ACPI meter stays
+unclassified. A scrape that carries only the NVML series has no socket power
+and writes no rows.
 
 ## Output Format
 
-`samples.csv` under `<log_dir>/<telemetry.storage_subdir>/cpu/` has header:
+`samples.csv` under `<log_dir>/<telemetry.storage_subdir>/cpu/` holds one row
+per socket per scrape. Schema v3 has header:
 
 ```
-schema_version, timestamp_unix, hostname, source, sensor, socket_id, power_w, total_power_w
+schema_version, timestamp_unix, hostname, source, sensor, socket_id, power_w, cpu_rail_w, soc_w, dram_w, module_w, total_power_w
 ```
 
-- **`power_w`** — the socket's power for that scrape: the ACPI `total`
-  envelope (`sensor` = `CPU<n>:cpuSidePowerUsageW`) or DCGM field 1130
-  (`sensor` = `CPU<n>:cpuPowerUsageW`, which is the CPU rail — see above);
-  granularity is per-socket.
-- **`cpu_rail_w`, `soc_w`, `dram_w`** — component rails for the socket, blank
-  when the source has no such reading. ACPI fills whichever rails the firmware
-  exposes; DCGM fills `cpu_rail_w` (= `power_w`, field 1130) and `soc_w`
-  (field 1132) and leaves `dram_w` blank.
-
-  A rail that could not be read is **blank, never `0`**, whatever the cause:
-  the exporter fell back to watching 1130 alone (blank on every row, one WARN
-  at startup); DCGM returned a non-OK status for that (socket, field) on that
-  scrape; or the value was zero or non-finite (every reader -- the exporter,
-  the scrape parser and the host collector -- drops it, since `0` from these
-  files means "not measured", not "idle": a live Grace socket draws tens of
-  watts). The primary is
-  different: a socket whose `power_w` source (ACPI `total`, or field 1130) is
-  missing on a scrape produces **no row** for that socket rather than a row
-  with blank `power_w`. Component rails never substitute for it and are
-  never summed into `total_power_w`, so a missing `soc_w` changes nothing
-  else on the row. Consumers should treat a blank rail as "unknown", not as
-  a zero-watt rail.
-- **`total_power_w`** — the node-level total for that scrape, duplicated on
-  every sensor row at the same `(hostname, timestamp_unix)`. In DCGM mode this
-  is the sum of the per-socket field-1130 values (CPU rails; SysIO is never
-  added). In ACPI mode it is **not** a sum of
-  the `cpu_rail`-, `soc`-, and `dram`-kind rails: whenever a `total`-kind
-  channel exists for a socket, that channel alone is the total. Real hardware
+- **`power_w`**: the socket primary reading. ACPI uses the `total` envelope; DCGM uses field 1130, the CPU rail. A socket without its primary reading gets no row.
+- **`cpu_rail_w`, `soc_w`, `dram_w`**: component rails, blank when absent. ACPI fills those its firmware exposes; DCGM fills `cpu_rail_w` (= `power_w`, field 1130) and `soc_w` (field 1132). Zero or non-finite readings are missing, never interpreted as idle power. Component rails never substitute for `power_w` or add to `total_power_w`.
+- **`total_power_w`**: the sum of `power_w` across the node's sockets, repeated on each socket row. ACPI totals measure the socket envelope; DCGM totals sum CPU rails and are not directly comparable. Hardware
   traces show the `total` rail at roughly 93-104W against `cpu_rail`+`soc`
-  combined at roughly 53-58W for the same socket — `total` measures the whole
-  Grace SoC power boundary, not literally `cpu_rail + soc`. **When no
-  `total`-kind channel is present for a scrape, `total_power_w` is left
-  blank** for every row from that scrape rather than guessed from the
-  component rails; per-sensor `power_w` values are still populated. Consumers
-  reading this CSV (e.g.
-  `srtctl.analysis.power_energy_report.load_cpu_samples`) must skip blank
-  `total_power_w` rows rather than treat them as `0`.
+  combined at roughly 53-58W for the same socket. `total` measures the whole
+  Grace SoC power boundary, not literally `cpu_rail + soc`.
+- **`module_w`**: superchip module power from NVML, a superset of `power_w`.
+  It covers Grace, its GPUs and the rest of the module, and is never
+  summed into `total_power_w`. Consumers that want the whole superchip use
+  `module_w` and must not add GPU power on top, because the GPUs are already
+  inside it. It is blank when no module reading arrived. The row's `source`
+  and `sensor` columns describe `power_w`. `module_w` always comes from
+  `cpu_power_nvml_watts`.
+
+v1 wrote one row per rail with no rail columns. v2 pivoted to one row per
+socket. v3 appended `module_w`. Readers accept all three.
 
 `cpu_manifest.json` alongside it is non-authoritative debugging metadata:
 per-node scrape/error counts and the resolved source mode, plus start/stop
@@ -232,9 +284,9 @@ import pandas as pd
 import numpy as np
 
 df = pd.read_csv("samples.csv")
-df = df[df["total_power_w"] != ""]  # skip scrapes with no total-kind channel
+df = df[df["total_power_w"] != ""]  # skip scrapes without a node total
 
-# total_power_w repeats across every sensor row for the same (hostname, timestamp);
+# total_power_w repeats across every socket row for the same (hostname, timestamp);
 # dedupe before integrating or sockets get double-counted.
 per_node_ts = (
     df[["hostname", "timestamp_unix", "total_power_w"]]
@@ -251,9 +303,10 @@ run_total_wh = energy_per_node_j.sum() / 3600
 
 Use trapezoidal integration (`np.trapezoid`; `np.trapz` was removed in numpy
 2.0), not `mean(power) * duration` — the scrape loop is not perfectly uniform,
-and scrape failures leave gaps. For per-sensor energy instead of per-node,
-group by `(hostname, sensor)` (or `(hostname, socket_id)`) on `power_w`
-instead of `total_power_w`.
+and scrape failures leave gaps. For per-socket energy instead of per-node,
+group by `(hostname, socket_id)` on `power_w` instead of `total_power_w`.
+Superchip energy integrates `module_w` the same way. Do not add GPU energy to
+it.
 
 ## Relationship to GPU Power Telemetry
 

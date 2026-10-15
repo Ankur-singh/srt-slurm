@@ -41,8 +41,7 @@ import numpy as np
 
 from srtctl.core.cpu_power import UTILIZATION_COLUMNS as CPU_UTILIZATION_COLUMNS
 from srtctl.core.power.contract import MAX_SAMPLE_GAP_SECONDS, UTILIZATION_METRICS
-from srtctl.core.power.cpu_rails import DCGM_PRIMARY_FIELD_ID, legacy_rail_rank
-from srtctl.core.power.cpu_rails import RAIL_COLUMN_NAMES as CPU_RAIL_COLUMN_NAMES
+from srtctl.core.power.cpu_rails import COMPONENT_RAIL_COLUMN_NAMES, DCGM_PRIMARY_FIELD_ID, legacy_rail_rank
 
 # DCGM-mode CPU power is field 1130 = the ACPI "CPU Power Socket N" rail read
 # through DCGM, not the "Grace Power Socket N" envelope (DCGM has no field for
@@ -470,7 +469,7 @@ def load_cpu_samples(path: Path) -> CpuSamples:
 
 def _is_wide_cpu_csv(fieldnames: Sequence[str] | None) -> bool:
     """Wide layout (one row per socket, rails as columns) vs. legacy long layout (one row per rail)."""
-    return fieldnames is not None and all(column in fieldnames for column in CPU_RAIL_COLUMN_NAMES)
+    return fieldnames is not None and all(column in fieldnames for column in COMPONENT_RAIL_COLUMN_NAMES)
 
 
 def _select_legacy_socket_series(

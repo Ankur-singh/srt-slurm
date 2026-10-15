@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, TypeGuard, cast
 
+from srtctl.core.power.cpu_rails import COMPONENT_RAIL_COLUMN_NAMES
 from srtctl.core.power.cpu_rails import RAIL_COLUMN_NAMES as CPU_RAIL_COLUMN_NAMES
 
 SCHEMA_VERSION = 1
@@ -73,11 +74,14 @@ SAMPLES_HEADER_V2 = (*SAMPLES_HEADER_V1, *(metric.column for metric in UTILIZATI
 SAMPLES_HEADER = (*SAMPLES_HEADER_V2, "temperature_c")
 
 CPU_SCHEMA_VERSION_V1 = 1
+CPU_SCHEMA_VERSION_V2 = 2
 # v2 pivots to one row per (timestamp, hostname, socket): power_w is the
 # socket's authoritative figure (ACPI "total" envelope or the DCGM value),
 # with the ACPI component rails as their own columns. v1 wrote one row per
 # rail, which left readers to work out which rows were the same socket.
-CPU_SCHEMA_VERSION = 2
+# v3 appends module_w before total_power_w: superchip module power, a superset
+# of power_w (it includes the GPUs), so it is never summed into total_power_w.
+CPU_SCHEMA_VERSION = 3
 CPU_SAMPLES_FILENAME = "samples.csv"  # written under <power_dir>/cpu/
 CPU_MANIFEST_FILENAME = "cpu_manifest.json"  # written under <power_dir>/cpu/, non-authoritative
 
@@ -91,6 +95,7 @@ CPU_SAMPLES_HEADER_V1 = (
     "power_w",
     "total_power_w",
 )
+CPU_SAMPLES_HEADER_V2 = (*CPU_SAMPLES_HEADER_V1[:-1], *COMPONENT_RAIL_COLUMN_NAMES, "total_power_w")
 CPU_SAMPLES_HEADER = (
     "schema_version",
     "timestamp_unix",
@@ -99,7 +104,7 @@ CPU_SAMPLES_HEADER = (
     "sensor",  # the sensor that fed power_w (provenance only)
     "socket_id",
     "power_w",  # ACPI: the socket "total" envelope; DCGM: field 1130 (= the CPU rail; DCGM has no envelope field)
-    *CPU_RAIL_COLUMN_NAMES,  # cpu_rail_w, soc_w, dram_w -- ACPI: from hwmon; DCGM: cpu_rail_w=1130, soc_w=1132
+    *CPU_RAIL_COLUMN_NAMES,  # cpu_rail_w, soc_w, dram_w -- ACPI: from hwmon; DCGM: cpu_rail_w=1130, soc_w=1132; module_w -- NVML
     "total_power_w",  # node aggregate: sum of power_w over sockets
 )
 # NOTE: in ACPI mode, power_w / total_power_w carry only "total"-kind channels

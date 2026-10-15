@@ -15,6 +15,11 @@ DCGM ``field_id`` it read; older ones publish only field 1130 with no label.
 Both go through :func:`cpu_sample.dcgm_rail_readings`, so an unlabelled
 sample is filed exactly like a labelled 1130.
 
+In either mode the exporter may also serve ``cpu_power_nvml_watts``, the
+superchip module power. It is the only source of the ``module`` rail and
+rides on the socket row of whichever base family won. A body with only NVML
+readings has no socket power and yields an empty scrape.
+
 Rail vocabulary comes from :mod:`srtctl.core.power.cpu_rails`; nothing here
 knows a firmware label by name.
 """
@@ -30,6 +35,7 @@ from srtctl.core.power.cpu_rails import (
     ACPI_RAIL_KINDS,
     DCGM_FIELD_RAIL_KINDS,
     DCGM_PRIMARY_FIELD_ID,
+    MODULE_KIND,
     classify_acpi_label,
     normalize_kind,
     sensor_name,
@@ -45,6 +51,7 @@ from srtctl.core.power.cpu_sample import (
 DCGM_METRIC = "cpu_power_dcgm_watts"
 DCGM_FIELD_LABEL = "field_id"
 ACPI_METRIC = "cpu_power_acpi_watts"
+NVML_METRIC = "cpu_power_nvml_watts"
 
 
 @dataclass(frozen=True)
@@ -55,7 +62,7 @@ class CpuReading:
     sensor: str
     socket_id: int
     power_w: float
-    kind: str  # cpu_rails.DCGM_KIND for dcgm; an ACPI_RAIL_KINDS member for acpi
+    kind: str  # cpu_rails.DCGM_KIND for dcgm; an ACPI_RAIL_KINDS member for acpi; MODULE_KIND for nvml
 
 
 @dataclass(frozen=True)
@@ -88,13 +95,14 @@ def parse_cpu_scrape(text: str) -> ParsedCpuScrape:
     except Exception:  # noqa: BLE001 - malformed exposition from a third-party parser
         return ParsedCpuScrape()
 
+    module_readings = _parse_nvml(families)
     acpi_readings = _parse_acpi(families)
     if acpi_readings:
-        return _scrape("acpi", acpi_readings)
+        return _scrape("acpi", acpi_readings + module_readings)
 
     dcgm_readings = _parse_dcgm(families)
     if dcgm_readings:
-        return _scrape("dcgm", dcgm_readings)
+        return _scrape("dcgm", dcgm_readings + module_readings)
 
     return ParsedCpuScrape()
 
@@ -170,6 +178,30 @@ def _parse_acpi(families) -> list[CpuReading]:
                     socket_id=socket_id,
                     power_w=value,
                     kind=kind,
+                )
+            )
+    return readings
+
+
+def _parse_nvml(families) -> list[CpuReading]:
+    readings: list[CpuReading] = []
+    for family in families:
+        for sample in family.samples:
+            if sample.name != NVML_METRIC or sample.labels.get("type") != MODULE_KIND:
+                continue
+            socket_id = _parse_socket(sample.labels.get("socket"))
+            if socket_id is None:
+                continue
+            value = sample.value
+            if not math.isfinite(value) or value <= 0:
+                continue
+            readings.append(
+                CpuReading(
+                    source="nvml",
+                    sensor=sensor_name(MODULE_KIND, socket_id),
+                    socket_id=socket_id,
+                    power_w=value,
+                    kind=MODULE_KIND,
                 )
             )
     return readings

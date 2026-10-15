@@ -8,8 +8,10 @@ import pytest
 from srtctl.core.power import cpu_rails
 from srtctl.core.power.cpu_rails import (
     ACPI_RAIL_KINDS,
+    COMPONENT_RAIL_COLUMN_NAMES,
     COMPONENT_RAIL_KINDS,
     RAIL_COLUMN_NAMES,
+    REFERENCE_RAIL_KINDS,
     SENSOR_SUFFIXES,
     classify_acpi_label,
     classify_sensor,
@@ -39,6 +41,7 @@ from srtctl.core.power.cpu_rails import (
         ("CPU Rail Output Power in uW socket 0", None),
         ("Total CPU Energy In uJ socket 0", None),
         ("Module Socket A", None),
+        ("Module Power Socket 1", None),
         ("Chipthrot DDR Throttle (samples x1000) socket 0", None),
     ],
 )
@@ -67,9 +70,16 @@ def test_classify_sensor_handles_legacy_scraper_oem_labels():
     assert classify_sensor("Module Socket A") == "other"
 
 
-def test_legacy_rail_rank_prefers_total_then_dcgm_then_components():
+def test_legacy_rail_rank_prefers_total_then_dcgm_then_reference_rails():
     ranked = sorted(
-        ["CPU0:socPowerUsageW", "CPU0:cpuPowerUsageW", "Grace Power Socket 0", "CPU0:dramPowerUsageW", "weird"],
+        [
+            "CPU0:modulePowerUsageW",
+            "CPU0:socPowerUsageW",
+            "CPU0:cpuPowerUsageW",
+            "Grace Power Socket 0",
+            "CPU0:dramPowerUsageW",
+            "weird",
+        ],
         key=legacy_rail_rank,
     )
     assert ranked == [
@@ -77,6 +87,7 @@ def test_legacy_rail_rank_prefers_total_then_dcgm_then_components():
         "CPU0:cpuPowerUsageW",
         "CPU0:socPowerUsageW",
         "CPU0:dramPowerUsageW",
+        "CPU0:modulePowerUsageW",
         "weird",
     ]
 
@@ -84,6 +95,7 @@ def test_legacy_rail_rank_prefers_total_then_dcgm_then_components():
 def test_normalize_kind_accepts_canonical_and_legacy_exporter_types():
     assert normalize_kind("total") == "total"
     assert normalize_kind("cpu_rail") == "cpu_rail"
+    assert normalize_kind("module") is None
     assert normalize_kind("grace") == "total"
     assert normalize_kind("cpu") == "cpu_rail"
     assert normalize_kind("sysio") == "soc"
@@ -94,12 +106,14 @@ def test_normalize_kind_accepts_canonical_and_legacy_exporter_types():
 
 def test_rail_columns_follow_component_kind_order():
     assert COMPONENT_RAIL_KINDS == ("cpu_rail", "soc", "dram")
-    assert RAIL_COLUMN_NAMES == ("cpu_rail_w", "soc_w", "dram_w")
+    assert REFERENCE_RAIL_KINDS == ("cpu_rail", "soc", "dram", "module")
+    assert RAIL_COLUMN_NAMES == ("cpu_rail_w", "soc_w", "dram_w", "module_w")
+    assert COMPONENT_RAIL_COLUMN_NAMES == ("cpu_rail_w", "soc_w", "dram_w")
     assert frozenset({"total", "cpu_rail", "soc", "dram"}) == ACPI_RAIL_KINDS
 
 
 def test_every_acpi_kind_has_a_sensor_suffix():
-    assert set(SENSOR_SUFFIXES) == ACPI_RAIL_KINDS | {cpu_rails.DCGM_KIND}
+    assert set(SENSOR_SUFFIXES) == ACPI_RAIL_KINDS | {cpu_rails.DCGM_KIND, cpu_rails.MODULE_KIND}
 
 
 def test_dcgm_fields_map_onto_acpi_component_rails():

@@ -23,20 +23,30 @@
 //!   fallback covers hosts where sysfs is hidden from this process but a
 //!   privileged nv-hostengine is reachable.)
 //!
+//! Alongside either back-end, optional `cpu_power_nvml_watts` reports one
+//! superchip module reading per Grace socket. Its background poller prevents
+//! NVML stalls from blocking CPU scrapes. See `nvml` for the meter's scope.
+//!
 //! Endpoints:
 //!   GET /metrics  — Prometheus text format
 //!   GET /health   — "ok\n"
 
 mod dcgm;
+mod nvml;
+
+#[cfg(test)]
+mod test_support;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::collections::btree_map::{BTreeMap, Entry};
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 use std::{fs, process};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -49,13 +59,15 @@ use tokio::time::{timeout, Duration};
 /// the socket ID must follow the phrase directly, so "Grace Power Socket 1"
 /// stays `total` even when the string also mentions CPU power elsewhere.
 ///
-/// Mirrors `AcpiPowerMeterReader._DOMAIN_PATTERNS` in
-/// `src/srtctl/core/cpu_power.py`: some platforms suffix a rail's OEM string
-/// with "in uW" (e.g. "Total Power in uW socket 0" vs. "Total Power socket
-/// 0"), so each variable-form domain lists both spellings. `total` is the
-/// complete CPU-side socket envelope (Grace's own reading, or a platform's
-/// generic "Total Power" rail); `cpu_rail`/`soc`/`dram` are component rails
-/// that must not be summed into a node's total power.
+/// Mirrors `ACPI_LABEL_PATTERNS` in `src/srtctl/core/power/cpu_rails.py`:
+/// some platforms suffix a rail's OEM string with "in uW" (e.g. "Total Power
+/// in uW socket 0" vs. "Total Power socket 0"), so each variable-form domain
+/// lists both spellings. `total` is the complete CPU-side socket envelope
+/// (Grace's own reading, or a platform's generic "Total Power" rail);
+/// `cpu_rail`/`soc`/`dram` are component rails that must not be summed into
+/// a node's total power. A firmware `Module Power Socket N` meter is left
+/// unclassified. Module power comes from NVML only (see `nvml.rs`), the one
+/// path verified on hardware.
 const OEM_KINDS: [(&str, &[&str]); 4] = [
     (
         "total",
@@ -106,10 +118,12 @@ const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 const MAX_REQUEST_BYTES: usize = 8192;
 /// Backpressure, not a happy-path size: a scrape target sees ~1 request/s.
 const MAX_CONNECTIONS: usize = 64;
-/// How often the background thread re-reads ACPI sysfs sensors.
-/// Each read blocks ~150 ms waiting for firmware; 6 sensors × 150 ms = ~900 ms,
-/// so a 1 s interval keeps the cache fresh without falling behind.
-const ACPI_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Sensor reads can block on firmware, so this delay adds to the read time;
+/// it does not define a fixed sampling period.
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Withhold stalled NVML readings so energy integration sees a gap instead
+/// of counting the last value indefinitely.
+const MODULE_STALE_AFTER: Duration = Duration::from_secs(3);
 
 #[derive(clap::ValueEnum, Clone, Debug, Default)]
 enum SourceMode {
@@ -173,13 +187,93 @@ struct Candidate {
     oem_info: Option<String>,
 }
 
-/// Live state shared across connection handlers.
 #[derive(Clone)]
 enum MetricsState {
-    /// Pre-rendered Prometheus text, refreshed every `ACPI_POLL_INTERVAL` by a
-    /// background OS thread.  Scrapes read from this cache and return instantly.
+    /// Cached exposition keeps blocking ACPI reads out of scrapes.
     Acpi(Arc<RwLock<String>>),
     Dcgm(Arc<Mutex<dcgm::DcgmReader>>),
+}
+
+struct ModuleSnapshot {
+    read_started_at: Instant,
+    body: String,
+}
+
+enum ModuleState {
+    Pending(Instant),
+    Unavailable,
+    Missing,
+    Ready(ModuleSnapshot),
+}
+
+#[derive(Debug, PartialEq)]
+enum ModuleStatus {
+    Pending,
+    Unavailable,
+    NotReady,
+    Missing,
+    Stale,
+    Fresh,
+}
+
+impl ModuleState {
+    fn status(&self, now: Instant) -> ModuleStatus {
+        match self {
+            Self::Pending(started) if now.duration_since(*started) <= MODULE_STALE_AFTER => {
+                ModuleStatus::Pending
+            }
+            Self::Pending(_) => ModuleStatus::NotReady,
+            Self::Unavailable => ModuleStatus::Unavailable,
+            Self::Missing => ModuleStatus::Missing,
+            Self::Ready(snapshot)
+                if now.duration_since(snapshot.read_started_at) <= MODULE_STALE_AFTER =>
+            {
+                ModuleStatus::Fresh
+            }
+            Self::Ready(_) => ModuleStatus::Stale,
+        }
+    }
+}
+
+fn report_module_status(warned: &mut bool, status: ModuleStatus) {
+    match status {
+        ModuleStatus::NotReady | ModuleStatus::Missing | ModuleStatus::Stale if !*warned => {
+            *warned = true;
+            tracing::warn!(
+                ?status,
+                "NVML module power missing or stale; omitting module series"
+            );
+        }
+        ModuleStatus::Fresh if *warned => {
+            *warned = false;
+            tracing::info!("NVML module power recovered");
+        }
+        _ => {}
+    }
+}
+
+#[derive(Clone)]
+struct Metrics {
+    base: MetricsState,
+    module: Arc<RwLock<ModuleState>>,
+}
+
+impl Metrics {
+    /// NVML is never called here. A stalled `nvmlDeviceGetFieldValues` (a GPU
+    /// in reset) must not stall a scrape and lose that interval's CPU power with it.
+    fn render(&self) -> String {
+        let mut body = match &self.base {
+            MetricsState::Acpi(cache) => cache.read().unwrap().clone(),
+            MetricsState::Dcgm(reader) => build_metrics_dcgm(reader),
+        };
+        let module = self.module.read().unwrap();
+        if module.status(Instant::now()) == ModuleStatus::Fresh {
+            if let ModuleState::Ready(snapshot) = &*module {
+                body.push_str(&snapshot.body);
+            }
+        }
+        body
+    }
 }
 
 fn read_text(p: &Path) -> Option<String> {
@@ -445,7 +539,7 @@ async fn read_request(stream: &mut TcpStream) -> Option<String> {
     timeout(READ_TIMEOUT, read_headers).await.ok()?
 }
 
-async fn handle_connection(mut stream: TcpStream, state: MetricsState) {
+async fn handle_connection(mut stream: TcpStream, metrics: Metrics) {
     let Some(req) = read_request(&mut stream).await else {
         return;
     };
@@ -464,13 +558,11 @@ async fn handle_connection(mut stream: TcpStream, state: MetricsState) {
         // /health deliberately touches no sensor: it must still answer while
         // the collection thread is stuck on a firmware read.
         ("GET" | "HEAD", "/health") => ("200 OK", "text/plain", "ok\n".to_owned()),
-        ("GET" | "HEAD", "/metrics") => {
-            let body = match &state {
-                MetricsState::Acpi(cache) => cache.read().unwrap().clone(),
-                MetricsState::Dcgm(reader) => build_metrics_dcgm(reader),
-            };
-            ("200 OK", "text/plain; version=0.0.4; charset=utf-8", body)
-        }
+        ("GET" | "HEAD", "/metrics") => (
+            "200 OK",
+            "text/plain; version=0.0.4; charset=utf-8",
+            metrics.render(),
+        ),
         ("GET" | "HEAD", _) => ("404 Not Found", "text/plain", "Not Found\n".to_owned()),
         _ => {
             extra_headers = "Allow: GET, HEAD\r\n";
@@ -595,7 +687,7 @@ fn decide_acpi(
     }
 }
 
-fn init_metrics_state(args: &Args) -> Result<MetricsState> {
+fn init_metrics_state(args: &Args) -> Result<(MetricsState, BTreeSet<String>)> {
     let probe =
         |sensors: &[Sensor]| probe_acpi_live(sensors, ACPI_PROBE_RETRIES, ACPI_PROBE_RETRY_DELAY);
     match decide_acpi(&args.source, &args.hwmon_root, probe)? {
@@ -634,7 +726,11 @@ fn init_metrics_state(args: &Args) -> Result<MetricsState> {
                 };
                 anyhow::bail!("DCGM yielded no live data: {reason}");
             }
-            Ok(MetricsState::Dcgm(Arc::new(Mutex::new(reader))))
+            let cpu_sockets = reader.cpu_ids.iter().map(u32::to_string).collect();
+            Ok((
+                MetricsState::Dcgm(Arc::new(Mutex::new(reader))),
+                cpu_sockets,
+            ))
         }
         Err(e) => anyhow::bail!("DCGM unavailable: {e}"),
     }
@@ -673,7 +769,7 @@ fn probe_acpi_live(sensors: &[Sensor], retries: u32, delay: Duration) -> Option<
     None
 }
 
-fn init_acpi_state(sensors: Vec<Sensor>) -> Result<MetricsState> {
+fn init_acpi_state(sensors: Vec<Sensor>) -> Result<(MetricsState, BTreeSet<String>)> {
     {
         let sensors: &'static [Sensor] = Vec::leak(sensors);
         tracing::info!(count = sensors.len(), "discovered ACPI sensors");
@@ -690,19 +786,73 @@ fn init_acpi_state(sensors: Vec<Sensor>) -> Result<MetricsState> {
         let cache = Arc::new(RwLock::new(initial));
         let cache_bg = Arc::clone(&cache);
 
-        // Background OS thread: re-reads all sensors every ACPI_POLL_INTERVAL so
-        // HTTP scrapes serve cached data and return in <1 ms.
+        // Keep blocking firmware reads off the HTTP request path.
         std::thread::Builder::new()
             .name("acpi-poller".to_owned())
             .spawn(move || loop {
-                std::thread::sleep(ACPI_POLL_INTERVAL);
+                std::thread::sleep(POLL_INTERVAL);
                 let snapshot = build_metrics(sensors);
                 *cache_bg.write().unwrap() = snapshot;
             })
             .context("spawn acpi-poller thread")?;
 
-        Ok(MetricsState::Acpi(cache))
+        let cpu_sockets = sensors
+            .iter()
+            .filter(|s| s.kind != "other")
+            .map(|s| s.socket.clone())
+            .collect();
+        Ok((MetricsState::Acpi(cache), cpu_sockets))
     }
+}
+
+fn start_module_poller(cpu_sockets: BTreeSet<String>) -> Result<Arc<RwLock<ModuleState>>> {
+    let cache = Arc::new(RwLock::new(ModuleState::Pending(Instant::now())));
+    let cache_bg = Arc::clone(&cache);
+    std::thread::Builder::new()
+        .name("nvml-poller".to_owned())
+        .spawn(move || {
+            let mut reader = match nvml::NvmlModuleReader::new(Path::new("/sys/bus/pci/devices")) {
+                Ok(reader) => reader,
+                Err(e) => {
+                    *cache_bg.write().unwrap() = ModuleState::Unavailable;
+                    tracing::info!(reason = %e, "NVML module power unavailable; module series not exported");
+                    return;
+                }
+            };
+            let sockets = reader.sockets();
+            tracing::info!(
+                gpu_count = reader.gpu_count(),
+                ?sockets,
+                "NVML module reader initialised"
+            );
+            // PCI NUMA IDs match ACPI sockets on the measured GB200 host;
+            // GB300 is unverified.
+            for socket in sockets {
+                if !cpu_sockets.contains(&socket.to_string()) {
+                    tracing::warn!(
+                        socket,
+                        cpu_sockets = ?cpu_sockets,
+                        "NVML module socket has no CPU power socket; its module reading will not be persisted"
+                    );
+                }
+            }
+            loop {
+                let read_started_at = Instant::now();
+                let readings = reader.read();
+                let fresh = if readings.is_empty() {
+                    ModuleState::Missing
+                } else {
+                    ModuleState::Ready(ModuleSnapshot {
+                        read_started_at,
+                        body: nvml::render_module_metrics(&readings),
+                    })
+                };
+                *cache_bg.write().unwrap() = fresh;
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        })
+        .context("spawn nvml-poller thread")?;
+    Ok(cache)
 }
 
 #[tokio::main]
@@ -713,7 +863,11 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
-    let state = init_metrics_state(&args)?;
+    let (base, cpu_sockets) = init_metrics_state(&args)?;
+    let metrics = Metrics {
+        base,
+        module: start_module_poller(cpu_sockets)?,
+    };
 
     let addr = SocketAddr::new(args.bind, args.port);
     let listener = TcpListener::bind(addr)
@@ -726,14 +880,21 @@ async fn main() -> Result<()> {
     let mut sigterm = unix_signal(SignalKind::terminate())?;
     let mut conns = JoinSet::new();
     let mut backoff = Duration::ZERO;
+    let mut module_tick = tokio::time::interval(POLL_INTERVAL);
+    module_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut module_warned = false;
     loop {
         let at_capacity = conns.len() >= MAX_CONNECTIONS;
         tokio::select! {
+            _ = module_tick.tick() => {
+                let status = metrics.module.read().unwrap().status(Instant::now());
+                report_module_status(&mut module_warned, status);
+            }
             // Reaping stays inside the select! so a signal is honoured while
             // the exporter is sitting at its connection limit.
             Some(_) = conns.join_next(), if at_capacity => {}
             stream = accept(&listener, &mut backoff), if !at_capacity => {
-                conns.spawn(handle_connection(stream, state.clone()));
+                conns.spawn(handle_connection(stream, metrics.clone()));
             }
             _ = signal::ctrl_c() => {
                 tracing::info!("received SIGINT, shutting down");
@@ -764,7 +925,94 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::capture_logs;
     use tempfile::TempDir;
+
+    #[test]
+    fn module_render_withholds_missing_and_stale_samples_then_recovers() {
+        let cpu = "cpu_power_acpi_watts{socket=\"0\",type=\"total\"} 88.000000\n";
+        let module = Arc::new(RwLock::new(ModuleState::Pending(Instant::now())));
+        let metrics = Metrics {
+            base: MetricsState::Acpi(Arc::new(RwLock::new(cpu.to_owned()))),
+            module: Arc::clone(&module),
+        };
+        let sample = || {
+            nvml::render_module_metrics(&[nvml::ModuleReading {
+                socket: 0,
+                gpus: vec![0, 1],
+                watts: 600.0,
+            }])
+        };
+        assert_eq!(metrics.render(), cpu);
+        for missing in [ModuleState::Unavailable, ModuleState::Missing] {
+            *module.write().unwrap() = missing;
+            assert_eq!(metrics.render(), cpu);
+        }
+        *module.write().unwrap() = ModuleState::Ready(ModuleSnapshot {
+            read_started_at: Instant::now(),
+            body: sample(),
+        });
+        let fresh = metrics.render();
+        assert!(fresh.starts_with(cpu));
+        assert!(fresh.contains(
+            "cpu_power_nvml_watts{type=\"module\",socket=\"0\",gpus=\"0,1\",source=\"nvml\"} 600.000000\n"
+        ));
+        *module.write().unwrap() = ModuleState::Ready(ModuleSnapshot {
+            read_started_at: Instant::now() - Duration::from_secs(4),
+            body: sample(),
+        });
+        assert_eq!(metrics.render(), cpu);
+        *module.write().unwrap() = ModuleState::Ready(ModuleSnapshot {
+            read_started_at: Instant::now(),
+            body: sample(),
+        });
+        assert_eq!(metrics.render(), fresh);
+    }
+
+    #[test]
+    fn module_warnings_wait_for_startup_and_repeat_only_after_recovery() {
+        let start = Instant::now();
+        let pending = ModuleState::Pending(start);
+        let stale = ModuleState::Ready(ModuleSnapshot {
+            read_started_at: start,
+            body: "module sample".to_owned(),
+        });
+        let fresh = ModuleState::Ready(ModuleSnapshot {
+            read_started_at: start + Duration::from_secs(6),
+            body: "new module sample".to_owned(),
+        });
+        let recovered = ModuleState::Ready(ModuleSnapshot {
+            read_started_at: start + Duration::from_secs(12),
+            body: "recovered module sample".to_owned(),
+        });
+        let logs = capture_logs(|| {
+            let mut warned = false;
+            for (state, at) in [
+                (&ModuleState::Unavailable, start),
+                (&pending, start),
+                (&pending, start + Duration::from_secs(3)),
+                (&pending, start + Duration::from_secs(4)),
+                (&pending, start + Duration::from_secs(5)),
+                (&ModuleState::Missing, start + Duration::from_secs(5)),
+                (&stale, start + Duration::from_secs(5)),
+                (&fresh, start + Duration::from_secs(6)),
+                (&fresh, start + Duration::from_secs(7)),
+                (&fresh, start + Duration::from_secs(10)),
+                (&fresh, start + Duration::from_secs(11)),
+                (&recovered, start + Duration::from_secs(12)),
+                (&ModuleState::Missing, start + Duration::from_secs(13)),
+                (&ModuleState::Unavailable, start + Duration::from_secs(14)),
+            ] {
+                report_module_status(&mut warned, state.status(at));
+            }
+        });
+        assert_eq!(logs.matches("WARN").count(), 3, "{logs}");
+        assert_eq!(logs.matches("INFO").count(), 2, "{logs}");
+        assert!(logs.contains("status=NotReady"), "{logs}");
+        assert!(logs.contains("status=Stale"), "{logs}");
+        assert!(logs.contains("status=Missing"), "{logs}");
+        assert!(logs.contains("NVML module power recovered"), "{logs}");
+    }
 
     #[test]
     fn dcgm_metrics_carry_field_id_and_keep_1130_first_per_socket() {
@@ -1255,6 +1503,10 @@ mod tests {
             classify_oem("CPU Rail Output Power in uW socket 0"),
             ("other", String::new())
         );
+        assert_eq!(
+            classify_oem("Module Power Socket 1"),
+            ("other", String::new())
+        );
     }
 
     #[test]
@@ -1308,7 +1560,10 @@ mod tests {
             &[("power1", Some("CPU Power Socket 0"), "150000000")],
         );
         let sensors: &'static [Sensor] = Vec::leak(discover_sensors(dir.path()).unwrap());
-        let state = MetricsState::Acpi(Arc::new(RwLock::new(build_metrics(sensors))));
+        let metrics = Metrics {
+            base: MetricsState::Acpi(Arc::new(RwLock::new(build_metrics(sensors)))),
+            module: Arc::new(RwLock::new(ModuleState::Unavailable)),
+        };
 
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
@@ -1316,7 +1571,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                handle_connection(stream, state.clone()).await;
+                handle_connection(stream, metrics.clone()).await;
             }
         });
 

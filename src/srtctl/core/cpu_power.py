@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from srtctl.core.power.cpu_rails import (
+    COMPONENT_RAIL_COLUMN_NAMES,
     COMPONENT_RAIL_KINDS,
     DCGM_FIELD_BY_ID,
     DCGM_FIELD_RAIL_KINDS,
@@ -48,7 +49,6 @@ from srtctl.core.power.cpu_rails import (
     DCGM_POWER_FIELD_IDS,
     DCGM_POWER_FIELDS,
     DCGM_PRIMARY_FIELD_ID,
-    RAIL_COLUMN_NAMES,
     TOTAL_KIND,
     classify_acpi_label,
     sensor_name,
@@ -135,7 +135,7 @@ SAMPLES_HEADER = (
     "sensor",  # the sensor that fed power_w (provenance only)
     "socket_id",
     "power_w",  # ACPI: the socket "total" envelope; DCGM: field 1130 (= the CPU rail; DCGM has no envelope field)
-    *RAIL_COLUMN_NAMES,  # cpu_rail_w, soc_w, dram_w -- ACPI: from hwmon; DCGM: cpu_rail_w=1130, soc_w=1132, dram_w blank
+    *COMPONENT_RAIL_COLUMN_NAMES,  # cpu_rail_w, soc_w, dram_w -- ACPI: from hwmon; DCGM: cpu_rail_w=1130, soc_w=1132, dram_w blank
     "total_power_w",  # node aggregate: sum of power_w over sockets
     *UTILIZATION_COLUMNS,
 )
