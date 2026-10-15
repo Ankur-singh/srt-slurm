@@ -69,10 +69,11 @@ Model configuration.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `path` | str | required | Model weights directory, or a `model_paths` alias from srtslurm.yaml. Mounted at /model. |
+| `path` | str | required | Model weights directory, model_paths alias, or hf:<repo-id>. Local paths are mounted at /model. |
 | `container` | str | required | Container image (`.sqsh` path or registry URI), or a `containers` alias from srtslurm.yaml. |
 | `precision` | str | required | Weight precision (`fp4`, `fp8`, `fp16`, `bf16`). Recorded with results; engine flags set the actual dtype. |
 | `stage_dir` | str \| None | `None` | Optional: stage the model from shared storage to this node-local dir before workers start (e.g. "/raid/scratch/models"). None = use path directly. |
+| `hf_snapshot_path` | str \| None | `None` | TRT-LLM container path to an HF cache snapshot; pins weights and benchmark tokenizer. |
 
 ### ResourceConfig
 
@@ -227,7 +228,7 @@ Benchmark configuration.
 | `mmlu` | MMLU accuracy evaluation benchmark. | `max_tokens`, `num_examples`, `num_threads`, `repeat` |
 | `mooncake-router` | Mooncake Router benchmark for testing KV-aware routing using aiperf. | `itl_threshold_ms`, `mooncake_workload`, `ttft_threshold_ms` |
 | `router` | Router performance benchmark. | `concurrency`, `isl`, `num_requests`, `osl`, `prefix_ratios` |
-| `sa-bench` | SA-Bench throughput and latency benchmark. | `custom_tokenizer`, `dataset_cache_dir`, `dataset_name`, `dataset_path`, `endpoint`, `isl`, `num_prompts_mult`, `num_warmup_mult`, `osl`, `random_range_ratio`, `req_rate`, `reuse_http_connections`, `slow_down_sleep_time`, `slow_down_wait_time`, `use_chat_template` |
+| `sa-bench` | SA-Bench throughput and latency benchmark. | `custom_tokenizer`, `dataset_cache_dir`, `dataset_name`, `dataset_path`, `endpoint`, `env`, `isl`, `num_prompts_mult`, `num_warmup_mult`, `osl`, `random_range_ratio`, `req_rate`, `reuse_http_connections`, `slow_down_sleep_time`, `slow_down_wait_time`, `use_chat_template` |
 | `sglang-bench` | SGLang benchmark runner. | `isl`, `osl`, `req_rate` |
 | `trace-replay` | Trace replay benchmark using aiperf with a user-provided dataset. | `itl_threshold_ms`, `trace_file`, `ttft_threshold_ms` |
 

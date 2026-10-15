@@ -55,6 +55,7 @@ def _runtime(tmp_path: Path | None = None) -> MagicMock:
     runtime.model_path = Path("/models/example-model")
     runtime.worker_model_arg = "/model"
     runtime.is_hf_model = False
+    runtime.hf_snapshot_path = None
     runtime.gpu_type = "h100"
     runtime.log_dir = tmp_path or Path("/tmp")
     runtime.network_interface = None
@@ -753,9 +754,7 @@ def test_sidecar_waits_for_listener_without_connecting(tmp_path: Path) -> None:
         f"Path({str(partial)!r}).write_bytes(conn.recv(16)); Path({str(partial)!r}).rename({str(accepted)!r}); "
         "time.sleep(60)"
     )
-    sidecar = (
-        f"import socket,time; socket.create_connection(('127.0.0.1', {port})).sendall(b'sidecar'); time.sleep(60)"
-    )
+    sidecar = f"import socket,time; socket.create_connection(('127.0.0.1', {port})).sendall(b'sidecar'); time.sleep(60)"
     command = build_sidecar_launch_command(
         engine=[sys.executable, "-c", engine],
         sidecar=[sys.executable, "-c", sidecar],
@@ -775,11 +774,15 @@ def test_sidecar_waits_for_listener_without_connecting(tmp_path: Path) -> None:
         child.wait(timeout=15)
 
 
-@pytest.mark.parametrize("memory_bind", [False, True, "local"])
-def test_trtllm_sidecar_uses_native_grpc_on_rank_zero(tmp_path: Path, memory_bind) -> None:
-    process = _process()
+@pytest.mark.parametrize(
+    ("mode", "memory_bind"),
+    [("agg", False), ("agg", True), ("agg", "local"), ("prefill", False), ("decode", False)],
+)
+def test_trtllm_sidecar_uses_native_grpc_on_rank_zero(tmp_path: Path, mode: str, memory_bind: bool | str) -> None:
+    process = _process(mode=mode)
     backend = TRTLLMBackend(
-        roles={"agg": RoleConfig(args={"tensor_parallel_size": 4, "max_seq_len": 4096})},
+        roles={mode: RoleConfig(args={"tensor_parallel_size": 4, "max_seq_len": 4096})},
+        served_model_name="Qwen/Qwen3-0.6B",
         numa_cpu_bind=memory_bind is not False,
         numa_memory_bind=memory_bind,
     )
@@ -790,14 +793,44 @@ def test_trtllm_sidecar_uses_native_grpc_on_rank_zero(tmp_path: Path, memory_bin
     assert "trtllm-llmapi-launch python3 -m tensorrt_llm.commands.serve /model" in script
     assert ("bash /configs/numa_cpu_bind.sh --bind-memory" in script) is (memory_bind == "local")
     assert ("numactl -m 0,1" in script) is (memory_bind is True)
-    assert "--grpc --host 127.0.0.1 --port 19000" in script
+    assert "--grpc --grpc-protocol openengine --host 127.0.0.1 --port 19000" in script
     assert "python3 -m dynamo.trtllm.sidecar --grpc-endpoint 127.0.0.1:19000 --model-path /model" in script
     assert "--context-length 4096" in script
     assert "${SLURM_PROCID:-0}" in script
+    assert "--served_model_name Qwen/Qwen3-0.6B" in script
+    assert "--tensor_parallel_size 4" in script
+    if mode == "agg":
+        assert "--disaggregation-mode" not in script
+    else:
+        assert f"--disaggregation-mode {mode}" in script
 
 
-def test_trtllm_sidecar_rejects_disaggregated_workers(tmp_path: Path) -> None:
+def test_trtllm_sidecar_rejects_direct_frontend(tmp_path: Path) -> None:
     backend = TRTLLMBackend()
 
-    with pytest.raises(ValueError, match="supports aggregated workers only"):
-        backend.build_worker_command(_process(mode="prefill"), [], _runtime(tmp_path))
+    with pytest.raises(ValueError, match="sidecar mode requires frontend.type: dynamo"):
+        backend.build_worker_command(
+            _process(mode="prefill"),
+            [],
+            _runtime(tmp_path),
+            frontend_type="trtllm_serve",
+        )
+
+
+def test_trtllm_sidecar_registers_hf_id_while_engine_uses_pinned_snapshot(tmp_path: Path) -> None:
+    snapshot = "/hf/hub/models--org--name/snapshots/" + "a" * 40
+    runtime = _runtime(tmp_path)
+    runtime.model_path = Path("org/name")
+    runtime.worker_model_arg = snapshot
+    runtime.is_hf_model = True
+    runtime.hf_snapshot_path = snapshot
+    backend = TRTLLMBackend(
+        roles={"prefill": RoleConfig(args={"tensor_parallel_size": 4, "max_seq_len": 4096})},
+        served_model_name="org/name",
+    )
+
+    script = backend.build_worker_command(_process(mode="prefill"), [], runtime)[2]
+
+    assert f"tensorrt_llm.commands.serve {snapshot} " in script
+    assert "dynamo.trtllm.sidecar --grpc-endpoint 127.0.0.1:19000 --model-path org/name " in script
+    assert "--served_model_name org/name" in script

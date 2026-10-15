@@ -593,11 +593,8 @@ class TRTLLMBackend(Backend):
         frontend = get_frontend(frontend_type)
 
         sidecar_config = get_dynamo_sidecar_config(runtime)
-        if sidecar_config is not None:
-            if frontend.worker_launch != "dynamo":
-                raise ValueError("TensorRT-LLM sidecar mode requires frontend.type: dynamo")
-            if mode != "agg":
-                raise ValueError("TensorRT-LLM sidecar mode supports aggregated workers only")
+        if sidecar_config is not None and frontend.worker_launch != "dynamo":
+            raise ValueError("TensorRT-LLM sidecar mode requires frontend.type: dynamo")
 
         # Write config to host path (log_dir)
         config_filename = f"trtllm_config_{mode}.yaml"
@@ -622,10 +619,16 @@ class TRTLLMBackend(Backend):
         base_prefix = list(nsys_prefix or []) + numactl_prefix + ["trtllm-llmapi-launch"]
 
         if sidecar_config is not None:
+            # The sidecar uses model-path as its Dynamo registration name. Keep the
+            # HF ID there while the native engine loads the pinned snapshot.
+            sidecar_model_arg = (
+                str(runtime.model_path) if runtime.is_hf_model and runtime.hf_snapshot_path else model_arg
+            )
             return self._build_sidecar_command(
                 process=process,
                 config=config,
                 model_arg=model_arg,
+                sidecar_model_arg=sidecar_model_arg,
                 container_config_path=container_config_path,
                 base_prefix=base_prefix,
                 sidecar_config=sidecar_config,
@@ -702,6 +705,7 @@ class TRTLLMBackend(Backend):
         process: "Process",
         config: dict[str, Any],
         model_arg: str,
+        sidecar_model_arg: str,
         container_config_path: Path,
         base_prefix: list[str],
         sidecar_config: "DynamoConfig",
@@ -717,6 +721,8 @@ class TRTLLMBackend(Backend):
                 "tensorrt_llm.commands.serve",
                 model_arg,
                 "--grpc",
+                "--grpc-protocol",
+                "openengine",
                 "--host",
                 "127.0.0.1",
                 "--port",
@@ -726,6 +732,16 @@ class TRTLLMBackend(Backend):
             ],
             bind_memory=bind_memory,
         )
+
+        if self.served_model_name:
+            engine.extend(["--served_model_name", self.served_model_name])
+        for flag, key in (
+            ("--tensor_parallel_size", "tensor_parallel_size"),
+            ("--moe_expert_parallel_size", "moe_expert_parallel_size"),
+            ("--pipeline_parallel_size", "pipeline_parallel_size"),
+        ):
+            if config.get(key) is not None:
+                engine.extend([flag, str(config[key])])
 
         sidecar = (
             [sidecar_config.sidecar_binary]
@@ -737,9 +753,11 @@ class TRTLLMBackend(Backend):
                 "--grpc-endpoint",
                 f"127.0.0.1:{grpc_port}",
                 "--model-path",
-                model_arg,
+                sidecar_model_arg,
             ]
         )
+        if process.endpoint_mode != "agg":
+            sidecar.extend(["--disaggregation-mode", process.endpoint_mode])
         context_length = sidecar_config.sidecar_context_length
         if context_length is None:
             context_length = config.get("max_seq_len") or config.get("max-seq-len")

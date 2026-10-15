@@ -338,6 +338,8 @@ def show_config_details(config: SrtConfig) -> None:
     mounts_table.add_column("Container Path", style="cyan")
 
     # Built-in mounts
+    if config.model.hf_snapshot_path:
+        console.print(f"Pinned HF model snapshot (engine and benchmark): {config.model.hf_snapshot_path}")
     try:
         model_path, is_hf_model = resolve_model_path(config.model.path)
     except (FileNotFoundError, ValueError):

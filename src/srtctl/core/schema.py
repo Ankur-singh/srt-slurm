@@ -674,7 +674,7 @@ class SweepConfig:
 class ModelConfig:
     """Model configuration."""
 
-    # Model weights directory, or a `model_paths` alias from srtslurm.yaml. Mounted at /model.
+    # Model weights directory, model_paths alias, or hf:<repo-id>. Local paths are mounted at /model.
     path: str
     # Container image (`.sqsh` path or registry URI), or a `containers` alias from srtslurm.yaml.
     container: str
@@ -683,6 +683,8 @@ class ModelConfig:
     # Optional: stage the model from shared storage to this node-local dir
     # before workers start (e.g. "/raid/scratch/models"). None = use path directly.
     stage_dir: str | None = None
+    # TRT-LLM container path to an HF cache snapshot; pins weights and benchmark tokenizer.
+    hf_snapshot_path: str | None = None
 
     Schema: ClassVar[type[Schema]] = Schema
 
@@ -714,9 +716,9 @@ class IdentityContainerConfig:
 class IdentityConfig:
     """Virtual identity for runtime verification and reproduction.
 
-    These fields declare what *should* be running. They are not used for
-    launching — only for verifying the runtime fingerprint matches expectations
-    and for helping others reproduce the run.
+    These fields declare what *should* be running. The model revision validates
+    model.hf_snapshot_path when one is set; the remaining identity fields are
+    used for runtime verification and reproduction.
 
     - model: HF repo + revision (verified against download metadata at runtime)
     - container: Docker image URI (recorded for reproduction, not verified)
@@ -2814,6 +2816,23 @@ class SrtConfig:
 
     def __post_init__(self):
         """Validate configuration after initialization."""
+        if isinstance(self.model, ModelConfig) and self.model.hf_snapshot_path is not None:
+            if not isinstance(self.engine, TRTLLMBackend):
+                raise ValueError("model.hf_snapshot_path currently requires engine.type: trtllm")
+            snapshot = Path(self.model.hf_snapshot_path)
+            model_id = self.model.path.removeprefix("hf:")
+            expected_repo_dir = "models--" + model_id.replace("/", "--")
+            if not self.model.path.startswith("hf:") or not snapshot.is_absolute():
+                raise ValueError("model.hf_snapshot_path requires an hf: model.path and an absolute container path")
+            if snapshot.parent.name != "snapshots" or snapshot.parent.parent.name != expected_repo_dir:
+                raise ValueError(
+                    "model.hf_snapshot_path must point to the model's HF cache snapshots/<revision> directory"
+                )
+            revision = self.identity.model.revision
+            if not revision or len(revision) != 40 or not is_commit_sha(revision) or snapshot.name != revision:
+                raise ValueError("model.hf_snapshot_path must end with identity.model.revision (a pinned commit SHA)")
+            if self.identity.model.repo and self.identity.model.repo != model_id:
+                raise ValueError("identity.model.repo must match model.path when model.hf_snapshot_path is set")
         self._validate_roles()
         _ = self.backend  # bind the roles onto the engine now, so a bad role setting fails at load
         self._validate_role_backends()

@@ -126,6 +126,7 @@ benchmark:
   req_rate: "inf"                    # Optional: Request rate (default: "inf")
   endpoint: "/v1/completions"        # Optional: API path (default: "/v1/completions")
   reuse_http_connections: false      # Optional: Reuse HTTP connections (default: false)
+  env: {}                            # Optional: Environment passed to the benchmark client
   dataset_cache_dir: "/lustre/shared/sa-bench-cache"  # Optional: Cache generated prompts
 ```
 
@@ -134,6 +135,8 @@ benchmark:
 On `/v1/chat/completions` the frontend renders the chat template itself, so SA-Bench sends the bare prompt as a message instead of rendering it a second time. Keep `use_chat_template: true` there: the template's tokens are reserved inside the `isl` budget, so the served input length still matches `isl`.
 
 When `reuse_http_connections` is enabled, each `benchmark_serving.py` process uses one keep-alive connection pool. Warmup and formal runs remain isolated in separate processes and therefore never share a pool. The option currently applies only to SA-Bench's Dynamo HTTP adapter.
+
+For offline Hugging Face models, mount the model cache in the benchmark container and set `HF_HUB_CACHE` and `HF_HUB_OFFLINE` in `benchmark.env`. The `glm_moe_dsa` custom tokenizer resolves a cached model ID to its local snapshot.
 
 #### Dataset caching
 

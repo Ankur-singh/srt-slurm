@@ -397,6 +397,7 @@ class RuntimeContext:
     # Fields with defaults must come after required fields
     # HuggingFace model support - True if model.path was "hf:model/name"
     is_hf_model: bool = False
+    hf_snapshot_path: str | None = None
     gpu_type: str | None = None
     visible_devices_env: str = "CUDA_VISIBLE_DEVICES"
 
@@ -594,6 +595,7 @@ class RuntimeContext:
             srun_options=dict(config.srun_options),
             environment=environment,
             is_hf_model=is_hf_model,
+            hf_snapshot_path=config.model.hf_snapshot_path,
             container_model_path=container_model_path,
             request_plane=config.dynamo.request_plane,
             dynamo=config.dynamo,
@@ -622,6 +624,7 @@ class RuntimeContext:
             srun_options=dict(config.srun_options),
             environment=environment,
             is_hf_model=is_hf_model,
+            hf_snapshot_path=config.model.hf_snapshot_path,
             stage_dir=stage_dir,
             staged_model_path=staged_model_path,
             container_model_path=container_model_path,
@@ -634,7 +637,7 @@ class RuntimeContext:
         """Model path passed to the serving worker: the staged node-local path
         when model staging is enabled, else the "/model" mount (or the HF id)."""
         if self.is_hf_model:
-            return str(self.model_path)
+            return self.hf_snapshot_path or str(self.model_path)
         if self.staged_model_path is not None:
             return str(self.staged_model_path)
         return str(self.container_model_path or "/model")

@@ -66,6 +66,7 @@ class SABenchRunner(BenchmarkRunner):
             "dataset_path",
             "dataset_cache_dir",
             "custom_tokenizer",
+            "env",
             "use_chat_template",
             "endpoint",
             "reuse_http_connections",
@@ -85,6 +86,9 @@ class SABenchRunner(BenchmarkRunner):
     @property
     def local_script_dir(self) -> str:
         return str(SCRIPTS_DIR / "sa-bench")
+
+    def get_environment(self, config: SrtConfig, runtime: RuntimeContext) -> dict[str, str]:
+        return dict(config.benchmark.env)
 
     def validate_config(self, config: SrtConfig) -> list[str]:
         errors = []
@@ -133,8 +137,7 @@ class SABenchRunner(BenchmarkRunner):
             prefill_gpus = 0
             decode_gpus = 0
 
-        # RuntimeContext resolves HF IDs, local /model mounts, and any
-        # cache-preserving mount needed by cache-inputs.
+        # RuntimeContext resolves HF IDs, pinned snapshots, and local model mounts.
         tokenizer_path = runtime.worker_model_arg
 
         dataset_name = b.dataset_name or "random"
