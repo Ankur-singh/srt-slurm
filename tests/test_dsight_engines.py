@@ -13,9 +13,10 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from test_dsight import CLIENT, ORIGIN, SERVER, write_run
+from test_dsight import CLIENT, ORIGIN, SERVER, trtllm_iteration_line, write_run
 
 from srtctl.dsight.build import build_dashboard
+from srtctl.dsight.engines import parse_engine_log, parse_trtllm_iteration
 from srtctl.dsight.importer import Importer
 from srtctl.dsight.query import TraceDataset
 
@@ -348,3 +349,65 @@ def test_snapshot_precision_agrees_with_source_window(tmp_path, fraction):
     assert data["meta"]["duration"] == pytest.approx(resolution)
     assert all(r["start"] == 0 and r["end"] == pytest.approx(resolution) for r in data["iterations"])
     assert data["meta"]["origin_ns"] == str(ORIGIN + 2_000_000_000 + int(fraction.ljust(9, "0")))
+
+
+def test_trtllm_iteration_keeps_every_recorded_field_in_order():
+    it = parse_trtllm_iteration(trtllm_iteration_line(12588, 3, "2026-09-17 10:58:33"))
+    assert it is not None
+    assert (it.iteration, it.global_rank, it.rank, it.local_time) == (12588, 3, 0, "2026-09-17 10:58:33")
+    assert (it.batch_requests, it.kv_cache_util, it.host_step_ms, it.previous_device_step_ms) == (18, 0.25, 0.001, 25.0)
+    fields = dict(it.fields)
+    assert list(fields)[:4] == ["iter", "global_rank", "rank", "num_scheduled_requests"]
+    assert fields["currank_total_requests"] == (32, 64)
+    assert fields["states.cached_kv_tokens"] == 512
+    assert fields["num_unscheduled"] == 2
+    assert "states" not in fields  # The dict flattens; its parent key is not repeated.
+    record = parse_engine_log(trtllm_iteration_line(1, 0, "2026-09-17 10:58:33"))
+    assert record is not None and record.backend == "trtllm" and record.iteration is not None
+
+
+def test_trtllm_iteration_passes_unknown_fields_through_by_value_shape():
+    line = trtllm_iteration_line(7, 0, "2026-09-17 10:58:33").replace(
+        "num_active = 20",
+        "future_ratio = 0.5, future_ms = 3ms, future_pair = 1/2, future_tag = warm, "
+        "future_list = [1, 2], num_active = 20",
+    )
+    line = line.replace("'cached_kv_tokens': 512}", "'cached_kv_tokens': 512, 'cached_kv_tokens_per_req': [7, 0, 9]}")
+    fields = dict(parse_trtllm_iteration(line).fields)
+    assert fields["future_ratio"] == 0.5
+    assert fields["future_ms"] == 3.0
+    assert fields["future_pair"] == (1, 2)
+    assert fields["future_tag"] == "warm"
+    assert fields["future_list"] == (1, 2)
+    assert fields["states.cached_kv_tokens_per_req"] == (7, 0, 9)
+    assert fields["num_active"] == 20
+
+
+def test_trtllm_iteration_tolerates_removed_and_unavailable_fields():
+    line = (
+        "iter = 1, global_rank = 0, rank = 0, kv_cache_util = N/A, prev_device_step_time = N/A, "
+        "timestamp = 2026-09-17 10:58:33"
+    )
+    it = parse_trtllm_iteration(line)
+    assert it is not None
+    assert it.kv_cache_util is it.previous_device_step_ms is it.batch_requests is it.host_step_ms is None
+    assert dict(it.fields)["prev_device_step_time"] is None
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Engine ID map only",
+        "for iter = 3 the loop retried",  # No ranks or timestamp: not the iteration log.
+        "iter = 1, global_rank = 0, rank = 0, timestamp = soon",
+        "iter = x, global_rank = 0, rank = 0, timestamp = 2026-09-17 10:58:33",
+        "iter = 1, global_rank = 0, timestamp = 2026-09-17 10:58:33",
+        "iter = 1, global_rank = 0, rank = 0, host_step_time = nanms, timestamp = 2026-09-17 10:58:33",
+    ],
+)
+def test_trtllm_iteration_requires_identity_and_time(line):
+    it = parse_trtllm_iteration(line)
+    if "nanms" in line:
+        assert it is not None and dict(it.fields)["host_step_time"] == "nanms"  # Never a non-finite number.
+    else:
+        assert it is None
