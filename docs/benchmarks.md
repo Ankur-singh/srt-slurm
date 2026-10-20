@@ -164,7 +164,7 @@ Cache files are named for the values that matter when deciding what to delete â€
 my-model-fp8_isl8192_osl1_n32_3f9ac2b1.pkl
 ```
 
-The digest covers the seed, range ratio, prefix length, chat-template behavior and tokenizer, so datasets that differ only in those never collide. A separate file per prompt count is expected: `num_prompts` is derived from the concurrency level, and because it changes how many draws come out of the seeded RNG, a dataset built for one concurrency is not a subset of another.
+The digest covers the seed, range ratio, prefix length, chat-template behavior and tokenizer, so datasets that differ only in those never collide. The tokenizer is identified by its file fingerprint, not by its container path, so `srtctl cache-inputs` and a job that mount the same model at different paths share one file. A separate file per prompt count is expected: `num_prompts` is derived from the concurrency level, and because it changes how many draws come out of the seeded RNG, a dataset built for one concurrency is not a subset of another.
 
 Each file stores the full parameter set alongside the prompts, including a SHA-256 fingerprint of the tokenizer files (`tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`). That fingerprint is verified on load, so replacing a checkpoint at the same path invalidates the cache instead of silently reusing prompts built for the old tokenizer. Model weights are deliberately not hashed â€” they never affect prompt generation.
 
