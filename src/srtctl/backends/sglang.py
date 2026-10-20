@@ -37,6 +37,7 @@ from srtctl.ports import (
     DIST_INIT_PORTS,
     DYN_SYSTEM_PORT_BASE,
     GRPC_HTTP_PORTS,
+    HTTP_PORTS,
     LMCACHE_SERVER_PORT,
     NCCL_PORTS,
 )
@@ -236,6 +237,10 @@ class SGLangBackend(Backend):
         """Convert endpoints to processes, each with its NCCL rendezvous port and its endpoint's dist-init port.
 
         A gRPC-mode leader also gets its HTTP sidecar port, which carries /metrics and the profiler routes.
+        Under Dynamo sidecars a follower gets an HTTP port too: SGLang runs a health server with
+        ``/metrics`` for the node's schedulers on every node rank >= 1, bound to ``--port``
+        (sgl-project/sglang 759111879457, ``entrypoints/engine.py`` and
+        ``utils/common.py:launch_dummy_health_check_server``); without one it binds port 0.
         """
         from srtctl.core.topology import endpoints_to_processes, port_allocator_for
 
@@ -261,6 +266,11 @@ class SGLangBackend(Backend):
         return [
             replace(
                 process,
+                http_port=(
+                    allocator.next(HTTP_PORTS, process.node)
+                    if dynamo_sidecar and not process.is_leader
+                    else process.http_port
+                ),
                 nccl_port=allocator.next(NCCL_PORTS),
                 dist_init_port=dist_init_ports[(process.endpoint_mode, process.endpoint_index)],
                 grpc_http_port=(
@@ -381,9 +391,7 @@ class SGLangBackend(Backend):
         # serves its own metrics on the system port regardless, but only merges the
         # engine's sglang:* series (KV usage, running requests, scheduler stages) into
         # that endpoint when SGLang was started with this flag.
-        mode_config = self.get_config_for_mode(mode)
-        if not any(key in mode_config for key in ("enable-metrics", "enable_metrics")):
-            cmd.append("--enable-metrics")
+        cmd.extend(_enable_metrics_args(self.get_config_for_mode(mode)))
 
         # Add disaggregation mode for prefill/decode workers (both dynamo and sglang frontend)
         if mode != "agg":
@@ -469,6 +477,11 @@ class SGLangBackend(Backend):
         is_leader = node_rank == 0
         leader_ip = get_hostname_ip(endpoint_nodes[0], runtime.network_interface)
         grpc_port = sidecar_grpc_port(process)
+        if process.http_port <= 0:
+            raise ValueError(
+                f"SGLang sidecar {mode} worker {process.endpoint_index} on {process.node} has no allocated "
+                "HTTP port; the topology was built without dynamo_sidecar=True"
+            )
 
         served_model_name = self.get_served_model_name(runtime.model_path.name)
         model_arg = runtime.worker_model_arg
@@ -484,10 +497,13 @@ class SGLangBackend(Backend):
                 served_model_name,
                 "--host",
                 "0.0.0.0",
+                # Leaders serve the full HTTP server beside native gRPC; followers serve a health
+                # server. Both carry /metrics with --enable-metrics (see sidecar_engine_metrics_port).
                 "--port",
                 str(process.http_port),
             ]
         )
+        engine.extend(_enable_metrics_args(config))
 
         # DP replicas are independent TP groups on this node. Let SGLang
         # allocate their NCCL ports: an explicit port is reused by every group
@@ -512,8 +528,8 @@ class SGLangBackend(Backend):
                 ]
             )
         kv_cfg = self.get_kv_events_config_for_mode(mode)
-        relay_kv_events = self.needs_telemetry_sidecar(process, endpoint_processes)
-        if is_leader or relay_kv_events:
+        runs_sidecar = self.runs_dynamo_sidecar(process, endpoint_processes)
+        if runs_sidecar:
             engine.extend(["--grpc-port", str(grpc_port)])
 
         # The SGLang sidecar discovers the publisher; SGLang still needs this
@@ -534,7 +550,7 @@ class SGLangBackend(Backend):
                 process.endpoint_index,
             )
         engine.extend(_config_to_cli_args(config))
-        if not is_leader and not relay_kv_events:
+        if not runs_sidecar:
             return engine
 
         sidecar = (
@@ -556,6 +572,26 @@ class SGLangBackend(Backend):
             startup_timeout=sidecar_config.sidecar_startup_timeout,
         )
 
+    def runs_dynamo_sidecar(self, process: "Process", endpoint_processes: list["Process"]) -> bool:
+        """The endpoint leader runs the serving sidecar; a follower runs one only to relay its KV events."""
+        nodes = list(dict.fromkeys(candidate.node for candidate in endpoint_processes))
+        return nodes.index(process.node) == 0 or self.needs_telemetry_sidecar(process, endpoint_processes)
+
+    def sidecar_engine_metrics_port(self, process: "Process", endpoint_processes: list["Process"]) -> int | None:
+        """Every node's ``--port`` serves ``/metrics`` unless the role turned ``enable-metrics`` off.
+
+        The leader runs the full HTTP server beside native gRPC
+        (sgl-project/sglang 759111879457, ``entrypoints/http_server.py``), with the
+        tokenizer's request histograms (TTFT, ITL, end-to-end latency) and its node's
+        scheduler series; a follower (node rank >= 1) runs a health server whose
+        ``/metrics`` carries the scheduler series of the DP ranks on that node
+        (``utils/common.py:launch_dummy_health_check_server``). Both mount the route
+        only with ``--enable-metrics``, which srtctl passes unless the role sets it.
+        """
+        if not _metrics_enabled(self.get_config_for_mode(process.endpoint_mode)) or process.http_port <= 0:
+            return None
+        return process.http_port
+
     def needs_telemetry_sidecar(self, process: "Process", endpoint_processes: list["Process"]) -> bool:
         """Whether a sidecar-enabled endpoint needs a KV relay on this follower."""
         nodes = list(dict.fromkeys(candidate.node for candidate in endpoint_processes))
@@ -568,6 +604,22 @@ class SGLangBackend(Backend):
             and process.kv_events_port is not None
             and _node_has_kv_publisher(self.get_config_for_mode(process.endpoint_mode), len(nodes), node_rank)
         )
+
+
+_ENABLE_METRICS_KEYS = ("enable-metrics", "enable_metrics")
+
+
+def _enable_metrics_args(config: Mapping[str, Any]) -> list[str]:
+    """``--enable-metrics`` unless the role's args set it (either way, ``_config_to_cli_args`` renders theirs)."""
+    return [] if any(key in config for key in _ENABLE_METRICS_KEYS) else ["--enable-metrics"]
+
+
+def _metrics_enabled(config: Mapping[str, Any]) -> bool:
+    """Whether the engine serves Prometheus: srtctl's default, or the role's own ``enable-metrics`` value."""
+    for key in _ENABLE_METRICS_KEYS:
+        if key in config:
+            return bool(config[key])
+    return True
 
 
 def _parallel_size(config: dict[str, Any], long_name: str, short_name: str) -> int:
