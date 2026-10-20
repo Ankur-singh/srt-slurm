@@ -23,6 +23,7 @@ from srtctl.dsight.importer import Importer
 from srtctl.dsight.mcp import query_trace
 from srtctl.dsight.model import lifecycle
 from srtctl.dsight.query import TraceDataset
+from srtctl.dsight.storage import FILENAME, write_store
 
 ORIGIN = 1789642711000000000
 CLIENT = "11111111-1111-4111-8111-111111111111"
@@ -620,6 +621,38 @@ def test_iteration_and_identity_on_one_line_preserve_ranks_window_and_provenance
         "evidence": [source, 1],
         "identity_ambiguous": False,
     }
+
+
+def test_sparse_iteration_fields_are_json_native_and_round_trip_through_the_store(artifacts, tmp_path):
+    logs, sqlites = artifacts
+    # A future format: shared keys removed or N/A, a new key, and an empty per-request list.
+    (logs / "prefill-host_prefill_w0.out").write_text(
+        "[TRT-LLM] [I] [_torch][RANK 2] iter = 7, global_rank = 2, rank = 0, kv_cache_util = N/A, "
+        "currank_total_requests = 0/0, prev_device_step_time = N/A, timestamp = 2026-09-17 10:58:33, "
+        "states = {'cached_kv_tokens_per_req': [], 'num_ctx_tokens': 0}, future_mode = warm\n"
+    )
+    data = Importer(logs, sqlites, iteration_timezone="UTC").run()
+    row = next(r for r in data["iterations"] if r["worker"] == "prefill-0")
+    assert [row[k] for k in ("batch_requests", "kv_cache_util", "host_step_ms", "previous_device_step_ms")] == [
+        None
+    ] * 4
+    assert list(row["fields"].items()) == [
+        ("iter", 7),
+        ("global_rank", 2),
+        ("rank", 0),
+        ("kv_cache_util", None),
+        ("currank_total_requests", [0, 0]),
+        ("prev_device_step_time", None),
+        ("timestamp", "2026-09-17 10:58:33"),
+        ("states.cached_kv_tokens_per_req", []),
+        ("states.num_ctx_tokens", 0),
+        ("future_mode", "warm"),
+    ]
+    assert json.loads(json.dumps(row["fields"], allow_nan=False)) == row["fields"]
+    write_store(data, tmp_path / FILENAME)
+    stored = TraceDataset.from_path(tmp_path / FILENAME).query("iterations", worker="prefill-0")
+    assert stored == TraceDataset(data).query("iterations", worker="prefill-0")
+    assert list(stored["items"][0]["fields"].items()) == list(row["fields"].items())  # Log order survives storage.
 
 
 def test_nvtx_selection_preserves_shared_annotations_and_detokenize_threshold(artifacts):
