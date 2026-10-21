@@ -1645,6 +1645,9 @@ class VLLMBackend(Backend):
             "data_parallel_hybrid_lb",
             "data-parallel-rank",
             "data_parallel_rank",
+            # srtctl owns the listener Tachometer, AIPerf and the sidecar reach.
+            "host",
+            "port",
         ):
             config.pop(key, None)
 

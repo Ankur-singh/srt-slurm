@@ -541,15 +541,7 @@ def _sglang_runtime():
         pytest.param({"enable-metrics": False}, id="dashed-false"),
         pytest.param({"enable_metrics": False}, id="underscored-false"),
         pytest.param({"enable-metrics": None}, id="null"),
-        pytest.param(
-            {"enable-metrics": False, "enable_metrics": True},
-            id="conflicting-aliases",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="BUG: _metrics_enabled reads only the dashed alias while _config_to_cli_args renders both, "
-                "so the engine serves /metrics that no target scrapes",
-            ),
-        ),
+        pytest.param({"enable-metrics": False, "enable_metrics": True}, id="conflicting-aliases"),
     ],
 )
 def test_sglang_engine_target_exists_iff_the_engine_gets_the_metrics_switch(args: dict[str, Any]) -> None:
@@ -701,15 +693,6 @@ def test_sidecar_with_a_non_dynamo_frontend_is_rejected(tmp_path, frontend_type:
         SrtConfig.from_yaml(path)
 
 
-_SCRAPED_LISTENER_OVERRIDE = pytest.mark.xfail(
-    strict=True,
-    reason="BUG: the sidecar command builders leave host/port in roles.<role>.args (the direct vLLM path pops "
-    "them with pop_vllm_orchestration_flags), so the recipe value is rendered after srtctl's flags and argparse "
-    "binds it, while Tachometer and AIPerf scrape the allocated port",
-)
-
-
-@_SCRAPED_LISTENER_OVERRIDE
 @pytest.mark.parametrize("override", [{"port": 30000}, {"host": "127.0.0.1"}], ids=["port", "host"])
 def test_sglang_recipe_host_or_port_cannot_move_the_scraped_listener(override: dict[str, Any]) -> None:
     backend, processes = _sglang_sidecar(override)
@@ -723,7 +706,6 @@ def test_sglang_recipe_host_or_port_cannot_move_the_scraped_listener(override: d
             assert _flag(engine, "--host") == "0.0.0.0"
 
 
-@_SCRAPED_LISTENER_OVERRIDE
 @pytest.mark.parametrize("override", [{"port": 30000}, {"host": "127.0.0.1"}], ids=["port", "host"])
 def test_vllm_hybrid_dp_recipe_host_or_port_cannot_move_the_scraped_listener(override: dict[str, Any]) -> None:
     """The hybrid launcher is Python ``vllm serve`` (argparse, last wins), so a repeated flag is not an error."""

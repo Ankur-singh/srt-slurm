@@ -469,6 +469,9 @@ class SGLangBackend(Backend):
             "disaggregation_mode",
             "disaggregation-bootstrap-port",
             "disaggregation_bootstrap_port",
+            # srtctl owns the listener Tachometer, AIPerf and the sidecar reach.
+            "host",
+            "port",
         ):
             config.pop(key, None)
 
@@ -615,11 +618,9 @@ def _enable_metrics_args(config: Mapping[str, Any]) -> list[str]:
 
 
 def _metrics_enabled(config: Mapping[str, Any]) -> bool:
-    """Whether the engine serves Prometheus: srtctl's default, or the role's own ``enable-metrics`` value."""
-    for key in _ENABLE_METRICS_KEYS:
-        if key in config:
-            return bool(config[key])
-    return True
+    """Whether the engine command carries ``--enable-metrics``: srtctl's default, or what the role's args render."""
+    role_args = {key: config[key] for key in _ENABLE_METRICS_KEYS if key in config}
+    return bool(_enable_metrics_args(config)) or "--enable-metrics" in _config_to_cli_args(role_args)
 
 
 def _parallel_size(config: dict[str, Any], long_name: str, short_name: str) -> int:
