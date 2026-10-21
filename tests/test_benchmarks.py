@@ -665,16 +665,9 @@ class TestCustomBenchmarkRunner:
 
         assert env["SRT_PREFILL_ENDPOINTS"] == "ip-node-a:6100"
         assert env["SRT_DECODE_ENDPOINTS"] == "ip-node-c:6100"
-        # Each leader's sidecar runtime endpoint, then every node's native SGLang endpoint;
-        # TP followers run no sidecar, so their system ports are never advertised.
-        assert env["AIPERF_SERVER_METRICS_URLS"].split(",") == [
-            "http://ip-node-c:7502/metrics",
-            "http://ip-node-c:6100/metrics",
-            "http://ip-node-d:6100/metrics",
-            "http://ip-node-a:7500/metrics",
-            "http://ip-node-a:6100/metrics",
-            "http://ip-node-b:6100/metrics",
-        ]
+        # One URL per logical leader, aligned with SRT_*_ENDPOINTS: the native SGLang endpoint.
+        # Followers serve /metrics too under sidecars, but custom runners list leaders only.
+        assert env["AIPERF_SERVER_METRICS_URLS"] == ("http://ip-node-a:6100/metrics,http://ip-node-c:6100/metrics")
 
     def test_aggregated_worker_endpoint_uses_http_port_without_dynamo(self):
         from unittest.mock import patch
@@ -1032,10 +1025,12 @@ class TestCustomBenchmarkRunner:
     def test_sidecar_metric_urls_ignore_standalone_publishing_option(
         self, benchmark_type, publish_metrics, publish_events_and_metrics
     ):
-        """The standalone dynamo.trtllm flag does not change sidecar URLs, and both runners agree.
+        """The standalone dynamo.trtllm flag does not change sidecar URLs.
 
-        Only the legacy combined flag advertises the rank-zero sidecar's runtime endpoint;
-        TRT-LLM's OpenEngine gRPC server serves no Prometheus endpoint of its own.
+        Built-in runners advertise the rank-zero sidecar's runtime endpoint only with the
+        legacy combined flag. Custom runners always get one live URL per logical worker for
+        drain detection: TRT-LLM's OpenEngine gRPC server serves no Prometheus endpoint of
+        its own, so that is the sidecar's runtime endpoint.
         """
         from unittest.mock import patch
 
@@ -1064,7 +1059,7 @@ class TestCustomBenchmarkRunner:
         ):
             env = stage._get_benchmark_env(runner)
 
-        if publish_events_and_metrics:
+        if benchmark_type == "custom" or publish_events_and_metrics:
             assert env["AIPERF_SERVER_METRICS_URLS"] == "http://ip-node-a:7500/metrics"
         else:
             assert "AIPERF_SERVER_METRICS_URLS" not in env

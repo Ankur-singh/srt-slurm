@@ -10,8 +10,10 @@ and check invariants rather than literal port numbers:
 
 * every Tachometer worker target is a port the allocator handed that process
   (``sys_port`` or ``http_port``), unique per host, under a unique name;
-* the AIPerf URL lists of the built-in and custom runners equal the Tachometer
-  worker URLs (modulo the documented TRT-LLM ``publish_events_and_metrics`` gate);
+* the built-in AIPerf URL list equals the Tachometer worker URLs (modulo the
+  documented TRT-LLM ``publish_events_and_metrics`` gate), and the custom list keeps
+  the docs/benchmarks.md contract: one live URL per logical leader, aligned with
+  ``SRT_*_ENDPOINTS``, preferring the native engine's endpoint;
 * ``runs_dynamo_sidecar`` is true exactly for the processes whose built command
   launches a sidecar, and the engine target's port is the ``--port`` the engine
   binds, on every interface, with ``--enable-metrics`` where SGLang needs it;
@@ -58,6 +60,7 @@ class Probe:
     tachometer: str
     aiperf_builtin: list[str]
     aiperf_custom: list[str]
+    logical_endpoints: list[tuple[str, str, int]]
     commands: dict[tuple[str, int, int], list[str]] = field(default_factory=dict)
 
     def tachometer_workers(self) -> list[dict[str, Any]]:
@@ -157,6 +160,7 @@ def probe(recipe: dict[str, Any], *, ipv6: bool = False, build_commands: bool = 
                 tachometer=orchestrator.tachometer_config_text(),
                 aiperf_builtin=[url for url in builtin.split(",") if url],
                 aiperf_custom=[url for url in custom.split(",") if url],
+                logical_endpoints=orchestrator._logical_worker_endpoints(),
             )
         if build_commands:
             backend = orchestrator.config.backend
@@ -387,13 +391,27 @@ def test_every_worker_target_is_an_allocated_port_unique_per_host(shape) -> None
         }
 
 
-def test_aiperf_runners_advertise_exactly_the_tachometer_worker_urls(shape) -> None:
+def test_aiperf_runners_advertise_live_tachometer_worker_urls(shape) -> None:
     _, result = shape
-    tachometer = [block["url"] for block in result.tachometer_workers()]
-    assert len(set(tachometer)) == len(tachometer)
-    # Built-in runners sort their physical list; custom runners keep scrape order.
-    assert result.aiperf_builtin == sorted(tachometer)
-    assert result.aiperf_custom == tachometer
+    blocks = {block["url"]: block for block in result.tachometer_workers()}
+    assert len(blocks) == len(result.tachometer_workers())
+    # Built-in runners get the whole Tachometer list, sorted.
+    assert result.aiperf_builtin == sorted(blocks)
+    # Custom runners keep one URL per logical leader, position by position with
+    # SRT_*_ENDPOINTS (consumers drain on it), and every URL is a live scrape target.
+    assert len(result.aiperf_custom) == len(result.logical_endpoints) > 0
+    engine_workers = {
+        (b["metadata"]["worker_role"], b["metadata"]["worker_index"], b["metadata"]["worker_process"])
+        for b in blocks.values()
+        if b["name"].endswith("_engine")
+    }
+    for url, (mode, host, _port) in zip(result.aiperf_custom, result.logical_endpoints, strict=True):
+        block = blocks[url]
+        metadata = block["metadata"]
+        assert metadata["worker_role"] == mode and _node_ip(metadata["hostname"]) == host
+        worker = (metadata["worker_role"], metadata["worker_index"], metadata["worker_process"])
+        # The native engine's endpoint wins wherever the leader's engine serves one.
+        assert block["name"].endswith("_engine") or worker not in engine_workers
 
 
 def test_the_process_that_runs_a_sidecar_is_the_one_whose_command_starts_it(shape) -> None:
@@ -423,7 +441,7 @@ def test_the_process_that_runs_a_sidecar_is_the_one_whose_command_starts_it(shap
             assert engine.count("--enable-metrics") == 1
 
 
-def test_trtllm_publication_gate_hides_urls_from_aiperf_but_not_from_tachometer() -> None:
+def test_trtllm_publication_gate_hides_urls_from_builtin_aiperf_only() -> None:
     recipe = _recipe(
         {"type": "trtllm", "publish_events_and_metrics": False},
         {"agg": {"nodes": 2, "workers": 1, "gpus": 8, "args": {"tensor_parallel_size": 8}}},
@@ -431,8 +449,11 @@ def test_trtllm_publication_gate_hides_urls_from_aiperf_but_not_from_tachometer(
     )
     result = probe(recipe, build_commands=False)
 
-    assert [block["name"] for block in result.tachometer_workers()] == ["backend_agg0_rank0"]
-    assert result.aiperf_builtin == [] and result.aiperf_custom == []
+    workers = result.tachometer_workers()
+    assert [block["name"] for block in workers] == ["backend_agg0_rank0"]
+    assert result.aiperf_builtin == []
+    # Custom runners are not gated (docs/benchmarks.md): drain detection keeps a live URL.
+    assert result.aiperf_custom == [workers[0]["url"]]
 
 
 # --- Rendering: IPv6, metadata, ordering -------------------------------------------------------
@@ -613,6 +634,44 @@ def test_sidecar_binary_does_not_change_targets() -> None:
         assert "/opt/bin/my-sidecar --grpc-endpoint" in command[2]
 
 
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        "vllm/dynamo-sidecar-agg.yaml",
+        "features/sglang-sidecar-multinode-dp.yaml",
+        "features/sglang-sidecar-multinode-disagg-dp.yaml",
+        "trtllm/dynamo-sidecar-disagg.yaml",
+    ],
+)
+def test_custom_runner_urls_keep_the_pre_sidecar_metrics_contract(recipe: str) -> None:
+    """Custom benchmarks drain on one URL per logical worker, positionally aligned with SRT_*_ENDPOINTS."""
+
+    def inspect(orchestrator: Any) -> tuple[list[str], list[tuple[str, str, int]], list[Process], Any]:
+        def ip(node: str, *args: Any, **kwargs: Any) -> str:
+            return _node_ip(node)
+
+        with patch("srtctl.cli.mixins.benchmark_stage.get_hostname_ip", ip):
+            env = orchestrator._get_aiperf_server_metrics_env(logical_workers_only=True)
+            logical = orchestrator._logical_worker_endpoints()
+        leaders = [
+            process
+            for process in orchestrator.backend_processes
+            if orchestrator.frontend.worker_endpoint_port(process, orchestrator.config, orchestrator.runtime)
+        ]
+        return env["AIPERF_SERVER_METRICS_URLS"].split(","), logical, leaders, orchestrator.config.backend
+
+    custom, logical, leaders, backend = with_orchestrator(EXAMPLES_DIR / recipe, NODES, inspect)
+
+    assert len(custom) == len(logical) == len(leaders) > 0
+    if isinstance(backend, TRTLLMBackend):
+        # The pre-feature URL named the endpoint port, where TRT-LLM's gRPC server serves nothing;
+        # the same position now names the leader's live sidecar runtime endpoint.
+        assert custom == [f"http://{_node_ip(p.node)}:{p.sys_port}/metrics" for p in leaders]
+    else:
+        # Exactly what 0324b429 advertised: http://<leader>:<SRT_*_ENDPOINTS port>/metrics.
+        assert custom == [f"http://{host}:{port}/metrics" for _, host, port in logical]
+
+
 def test_tachometer_disabled_still_advertises_sidecar_urls_to_aiperf() -> None:
     recipe = _recipe(
         "vllm",
@@ -622,7 +681,9 @@ def test_tachometer_disabled_still_advertises_sidecar_urls_to_aiperf() -> None:
     result = probe(recipe, build_commands=False)
 
     assert len(result.aiperf_builtin) == 2
-    assert result.aiperf_custom == [block["url"] for block in result.tachometer_workers()]
+    assert result.aiperf_custom == [
+        block["url"] for block in result.tachometer_workers() if block["name"] == "backend_agg0_rank0_engine"
+    ]
 
 
 @pytest.mark.parametrize("frontend_type", ["sglang", "vllm", "trtllm_serve"])

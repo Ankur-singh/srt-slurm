@@ -85,23 +85,59 @@ def sidecar_worker_metrics_targets(
     (ai-dynamo/dynamo 3e72af98f8a5, ``lib/sidecar``), so the engine is scraped
     itself. Tachometer and the AIPerf server-metrics URLs both read this list.
     """
-    groups: dict[tuple[str, int], list[Process]] = {}
-    for process in processes:
-        groups.setdefault((process.endpoint_mode, process.endpoint_index), []).append(process)
+    groups = _endpoint_groups(processes)
     targets: list[WorkerMetricsTarget] = []
     for process in sorted(processes, key=lambda p: (p.endpoint_mode, p.endpoint_index, p.node_rank, p.node)):
         endpoint_processes = groups[(process.endpoint_mode, process.endpoint_index)]
-        runtime_path = frontend.worker_metrics_path(backend, process.endpoint_mode)
-        if (
-            runtime_path is not None
-            and process.sys_port > 0
-            and backend.runs_dynamo_sidecar(process, endpoint_processes)
-        ):
-            targets.append(WorkerMetricsTarget(process, process.sys_port, runtime_path))
-        engine_port = backend.sidecar_engine_metrics_port(process, endpoint_processes)
-        if engine_port is not None:
-            targets.append(WorkerMetricsTarget(process, engine_port, backend.prometheus_metrics_path, engine=True))
+        if runtime := _sidecar_runtime_target(process, endpoint_processes, backend, frontend):
+            targets.append(runtime)
+        if engine := _sidecar_engine_target(process, endpoint_processes, backend):
+            targets.append(engine)
     return targets
+
+
+def sidecar_logical_worker_metrics_target(
+    process: Process, processes: Sequence[Process], backend: Backend, frontend: Frontend
+) -> WorkerMetricsTarget | None:
+    """The one metrics endpoint a Dynamo sidecar job advertises for a logical worker to custom benchmarks.
+
+    Custom benchmarks receive one URL per logical worker, aligned position by
+    position with ``SRT_*_ENDPOINTS`` (``docs/benchmarks.md``), so ``process``
+    is the worker's routable leader. That is the native engine's own endpoint
+    where it serves one (the leader's HTTP port for vLLM and SGLang), else the
+    sidecar's runtime endpoint (TRT-LLM's OpenEngine gRPC server serves none),
+    so a consumer that drains on the list always gets a live URL per worker.
+    """
+    endpoint_processes = _endpoint_groups(processes)[(process.endpoint_mode, process.endpoint_index)]
+    return _sidecar_engine_target(process, endpoint_processes, backend) or _sidecar_runtime_target(
+        process, endpoint_processes, backend, frontend
+    )
+
+
+def _endpoint_groups(processes: Sequence[Process]) -> dict[tuple[str, int], list[Process]]:
+    """Every process of each logical worker, keyed by (mode, index), as the command builder sees them."""
+    groups: dict[tuple[str, int], list[Process]] = {}
+    for process in processes:
+        groups.setdefault((process.endpoint_mode, process.endpoint_index), []).append(process)
+    return groups
+
+
+def _sidecar_runtime_target(
+    process: Process, endpoint_processes: list[Process], backend: Backend, frontend: Frontend
+) -> WorkerMetricsTarget | None:
+    path = frontend.worker_metrics_path(backend, process.endpoint_mode)
+    if path is None or process.sys_port <= 0 or not backend.runs_dynamo_sidecar(process, endpoint_processes):
+        return None
+    return WorkerMetricsTarget(process, process.sys_port, path)
+
+
+def _sidecar_engine_target(
+    process: Process, endpoint_processes: list[Process], backend: Backend
+) -> WorkerMetricsTarget | None:
+    port = backend.sidecar_engine_metrics_port(process, endpoint_processes)
+    if port is None:
+        return None
+    return WorkerMetricsTarget(process, port, backend.prometheus_metrics_path, engine=True)
 
 
 @dataclass(frozen=True)

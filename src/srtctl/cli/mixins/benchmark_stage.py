@@ -32,7 +32,7 @@ from srtctl.core.power.contract import (
 from srtctl.core.processes import terminate_and_reap
 from srtctl.core.slurm import get_hostname_ip, start_srun_process
 from srtctl.core.status import JobStage, JobStatus, StatusReporter
-from srtctl.core.telemetry import sidecar_worker_metrics_targets
+from srtctl.core.telemetry import sidecar_logical_worker_metrics_target, sidecar_worker_metrics_targets
 from srtctl.frontends import FRONTEND_NONE, get_frontend
 from srtctl.ports import FRONTEND_PUBLIC_PORT, SGLANG_HTTP_PORT_BASE
 from srtctl.runtime_scripts.nsys_window import finish as finish_nsys_windows
@@ -733,9 +733,11 @@ class BenchmarkStageMixin:
         benchmarks use logical worker leaders so distributed SGLang follower
         ranks are not advertised as separate engines, except the followers of a
         role that owns attention-DP ranks (see ``_process_owns_dp_ranks``).
-        A Dynamo sidecar job advertises, for both, exactly what Tachometer
+        In a Dynamo sidecar job, built-in runners get exactly what Tachometer
         scrapes (``sidecar_worker_metrics_targets``): each sidecar's runtime
-        endpoint and each native engine's own Prometheus endpoint.
+        endpoint and each native engine's own Prometheus endpoint. Custom
+        runners keep one URL per logical leader, aligned with
+        ``SRT_*_ENDPOINTS`` (``sidecar_logical_worker_metrics_target``).
         """
         urls: list[str] = []
         frontend = self.frontend
@@ -753,12 +755,24 @@ class BenchmarkStageMixin:
                 (not self.config.dynamo.sidecar and backend.dynamo_metrics_flags) or backend.publish_events_and_metrics
             )
         )
-        if self.config.dynamo.sidecar:
+        if self.config.dynamo.sidecar and logical_workers_only:
+            # One live URL per routable logical leader, in SRT_*_ENDPOINTS order;
+            # consumers such as drain detection read them positionally. Like the
+            # other sidecar URLs before it, this list is not gated on TRT-LLM's
+            # publish flags, which never reach a sidecar.
+            for process in self.backend_processes:
+                if frontend.worker_endpoint_port(process, self.config, self.runtime) is None:
+                    continue
+                target = sidecar_logical_worker_metrics_target(process, self.backend_processes, backend, frontend)
+                if target is not None:
+                    host = get_hostname_ip(process.node, self.runtime.network_interface)
+                    urls.append(f"http://{url_host(host)}:{target.port}{target.path}")
+        elif self.config.dynamo.sidecar:
             # Only processes that run a sidecar serve its runtime metrics, and the
             # native engine serves its own on a separate port (none for TRT-LLM's
             # gRPC server). TRT-LLM sidecars do not receive --publish-metrics, so
-            # only the legacy combined flag opens the gate above, for both runners;
-            # runtime-only metrics are not advertised as an engine-metrics capture.
+            # only the legacy combined flag opens the gate above; runtime-only
+            # metrics are not advertised as an engine-metrics capture.
             if not dynamo_trtllm_metrics_disabled:
                 for target in sidecar_worker_metrics_targets(self.backend_processes, backend, frontend):
                     host = get_hostname_ip(target.process.node, self.runtime.network_interface)
