@@ -47,6 +47,8 @@ METRICS = {
 # Column or inline label keys that scope a series to a rank, in precedence order,
 # with the recorded rank kind. Data-parallel keys apply only to a worker's own
 # endpoints: a router series' dp_rank names its routing target, not its source.
+# They are read from the series' inline labels only: Tachometer metadata columns
+# are static per endpoint, so an extra_metadata key of the same name is no rank.
 # SGLang schedulers label their DP rank dp_rank; vLLM labels each data-parallel
 # engine with its DP rank as engine (vLLM b272cff368 engine-core-client).
 _RANK_KEYS = (("global_rank", "global_rank"), ("rank", "rank"))
@@ -319,15 +321,13 @@ def read_metrics(run: Importer) -> list[dict[str, Any]]:
                     if key not in _VALUE_COLUMNS and row[key] not in (None, "")
                 }
                 labels.update({f"metric.{key}": value for key, value in metric_labels.items()})
-                rank_keys = _RANK_KEYS + (_WORKER_RANK_KEYS if worker not in (None, "frontend") else ())
+                candidates = [
+                    (value, kind) for key, kind in _RANK_KEYS for value in (row.get(key), metric_labels.get(key))
+                ]
+                if worker not in (None, "frontend"):
+                    candidates += [(metric_labels.get(key), kind) for key, kind in _WORKER_RANK_KEYS]
                 rank, rank_kind = next(
-                    (
-                        (value, kind)
-                        for key, kind in rank_keys
-                        for value in (row.get(key), metric_labels.get(key))
-                        if value is not None and value != ""
-                    ),
-                    (None, None),
+                    ((value, kind) for value, kind in candidates if value is not None and value != ""), (None, None)
                 )
                 key = (name, histogram, host, gpu, tuple(sorted(labels.items())))
                 if key not in series_by_key:

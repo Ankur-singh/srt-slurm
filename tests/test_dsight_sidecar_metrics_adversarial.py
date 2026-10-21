@@ -296,11 +296,6 @@ def test_hybrid_dp_engines_on_two_nodes_are_distinct_ranks_of_one_worker(tmp_pat
     assert {s["host"] for s in running if int(s["rank"]) >= 4} == {"n1"}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: read_metrics takes dp_rank/engine from row columns too, so a tachometer.extra_metadata key "
-    "named engine (static metadata on every endpoint) becomes the DP rank of every worker series",
-)
 def test_extra_metadata_named_engine_is_not_a_dp_rank(tmp_path) -> None:
     metadata = {**WORKER, "engine": "sglang"}
     write_capture(
