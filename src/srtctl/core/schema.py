@@ -2460,7 +2460,7 @@ class DynamoConfig:
     event_plane: EventPlane | None = None
     # Job-wide native sidecar mode; prefer `roles.<role>.sidecar: true`.
     sidecar: bool = False
-    # Base loopback gRPC port between engine and sidecar; co-located workers get deterministic offsets.
+    # Base gRPC port between engine and sidecar; co-located workers get deterministic offsets. The sidecar dials it on loopback; vLLM and SGLang bind it on the engine's host (0.0.0.0).
     sidecar_port: int = DYNAMO_SIDECAR_GRPC_PORT
     # Standalone sidecar executable; unset runs `python3 -m dynamo.<framework>.sidecar`.
     sidecar_binary: str | None = None

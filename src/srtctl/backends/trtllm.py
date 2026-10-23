@@ -722,6 +722,20 @@ class TRTLLMBackend(Backend):
 
         return self._wrap_with_numa_cpu_bind(cmd)
 
+    def runs_dynamo_sidecar(self, process: "Process", endpoint_processes: list["Process"]) -> bool:
+        """One sidecar per endpoint, on global MPI rank zero, which lands on the leader node.
+
+        The endpoint's srun lists the leader's tasks first and ``_build_sidecar_command``
+        starts the sidecar only where ``SLURM_PROCID`` is 0 (``rank_zero_only``), with the
+        leader's ``DYN_SYSTEM_PORT``.
+
+        No ``sidecar_engine_metrics_port``: ``tensorrt_llm.commands.serve --grpc`` replaces
+        the OpenAI server and serves no Prometheus or iteration-stats endpoint; its only
+        load signal is the OpenEngine ``GetLoad`` RPC (NVIDIA/TensorRT-LLM 7695494b8f,
+        ``tensorrt_llm/commands/serve.py``), and the Dynamo sidecar does not bridge it.
+        """
+        return process.is_leader
+
     def _build_sidecar_command(
         self,
         *,

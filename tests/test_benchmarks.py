@@ -645,13 +645,17 @@ class TestCustomBenchmarkRunner:
         from srtctl.benchmarks.custom import CustomBenchmarkRunner
         from srtctl.core.topology import Process
 
+        # Sidecar topologies give SGLang followers an HTTP port for their health server's /metrics.
         processes = [
             Process("node-a", frozenset(range(4)), 7500, 6100, "prefill", 0, node_rank=0),
-            Process("node-b", frozenset(range(4)), 7501, 0, "prefill", 0, node_rank=1),
+            Process("node-b", frozenset(range(4)), 7501, 6100, "prefill", 0, node_rank=1),
             Process("node-c", frozenset(range(4)), 7502, 6100, "decode", 0, node_rank=0),
-            Process("node-d", frozenset(range(4)), 7503, 0, "decode", 0, node_rank=1),
+            Process("node-d", frozenset(range(4)), 7503, 6100, "decode", 0, node_rank=1),
         ]
-        stage = self._benchmark_stage("dynamo", processes, dynamo_sidecar=True)
+        tp8 = {"tensor-parallel-size": 8}
+        stage = self._benchmark_stage(
+            "dynamo", processes, dynamo_sidecar=True, engine_args={"prefill": tp8, "decode": tp8}
+        )
 
         with patch(
             "srtctl.cli.mixins.benchmark_stage.get_hostname_ip",
@@ -661,6 +665,8 @@ class TestCustomBenchmarkRunner:
 
         assert env["SRT_PREFILL_ENDPOINTS"] == "ip-node-a:6100"
         assert env["SRT_DECODE_ENDPOINTS"] == "ip-node-c:6100"
+        # One URL per logical leader, aligned with SRT_*_ENDPOINTS: the native SGLang endpoint.
+        # Followers serve /metrics too under sidecars, but custom runners list leaders only.
         assert env["AIPERF_SERVER_METRICS_URLS"] == ("http://ip-node-a:6100/metrics,http://ip-node-c:6100/metrics")
 
     def test_aggregated_worker_endpoint_uses_http_port_without_dynamo(self):
@@ -1019,14 +1025,23 @@ class TestCustomBenchmarkRunner:
     def test_sidecar_metric_urls_ignore_standalone_publishing_option(
         self, benchmark_type, publish_metrics, publish_events_and_metrics
     ):
-        """The standalone dynamo.trtllm flag does not change existing sidecar URLs."""
+        """The standalone dynamo.trtllm flag does not change sidecar URLs.
+
+        Built-in runners advertise the rank-zero sidecar's runtime endpoint only with the
+        legacy combined flag. Custom runners always get one live URL per logical worker for
+        drain detection: TRT-LLM's OpenEngine gRPC server serves no Prometheus endpoint of
+        its own, so that is the sidecar's runtime endpoint.
+        """
         from unittest.mock import patch
 
         from srtctl.benchmarks.custom import CustomBenchmarkRunner
         from srtctl.benchmarks.trace_replay import TraceReplayRunner
         from srtctl.core.topology import Process
 
-        processes = [Process("node-a", frozenset(range(4)), 7500, 6100, "agg", 0, node_rank=0)]
+        processes = [
+            Process("node-a", frozenset(range(4)), 7500, 6100, "agg", 0, node_rank=0),
+            Process("node-b", frozenset(range(4)), 7501, 0, "agg", 0, node_rank=1),
+        ]
         stage = self._benchmark_stage(
             "dynamo",
             processes,
@@ -1044,9 +1059,7 @@ class TestCustomBenchmarkRunner:
         ):
             env = stage._get_benchmark_env(runner)
 
-        if benchmark_type == "custom":
-            assert env["AIPERF_SERVER_METRICS_URLS"] == "http://ip-node-a:6100/metrics"
-        elif publish_events_and_metrics:
+        if benchmark_type == "custom" or publish_events_and_metrics:
             assert env["AIPERF_SERVER_METRICS_URLS"] == "http://ip-node-a:7500/metrics"
         else:
             assert "AIPERF_SERVER_METRICS_URLS" not in env

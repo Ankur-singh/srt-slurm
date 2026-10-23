@@ -109,7 +109,11 @@ class DynamoFrontend(DynamicFrontend):
     worker_launch: ClassVar[Literal["dynamo", "direct"]] = "dynamo"
 
     def worker_metrics_port(self, process: "Process", runtime: "RuntimeContext") -> int | None:
-        """Every rank runs the Dynamo system status server (health, metrics) on its system port."""
+        """Every rank runs the Dynamo system status server (health, metrics) on its system port.
+
+        A Dynamo sidecar job does not ask this: only some ranks run a sidecar and the native
+        engine serves its own metrics, so the backend answers (``sidecar_worker_metrics_targets``).
+        """
         return process.sys_port if process.sys_port > 0 else None
 
     def worker_endpoint_port(self, process: "Process", config: Any, runtime: "RuntimeContext") -> int | None:
