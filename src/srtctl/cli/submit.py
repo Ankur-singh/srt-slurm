@@ -555,6 +555,14 @@ def show_config_details(config: SrtConfig) -> None:
                 "outlives this allocation and is inherited by the next job on these nodes."
             )
 
+    # --- Node release before post-processing (srtslurm.yaml) ---
+    if get_srtslurm_setting("release_nodes_before_postprocess", False):
+        console.print(
+            "[bold cyan]Node release:[/] after workers stop, the job shrinks to its batch host "
+            "(scontrol update NodeList=<batch host>); the S3 upload and AI analysis run there "
+            "[dim]source: srtslurm.yaml release_nodes_before_postprocess[/]"
+        )
+
     # --- post_eval (RUN_EVAL / EVAL_ONLY dispatch) ---
     if config.post_eval.passthrough_env or config.post_eval.command:
         console.print("[bold cyan]Post-eval dispatch:[/]")

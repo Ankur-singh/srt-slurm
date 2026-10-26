@@ -453,6 +453,10 @@ class ClusterConfig:
     # --no-preflight had been passed. The framework still fails loudly at
     # runtime if a path is genuinely missing on the compute node.
     preflight: bool = True
+    # After workers stop, shrink the job to its batch host (`scontrol update NodeList=`) so the
+    # other nodes return to the scheduler before the S3 upload and AI analysis, which then run
+    # on the batch host. Needs job shrinking enabled (no `disable_job_shrink`); skipped for het jobs.
+    release_nodes_before_postprocess: bool = False
 
     Schema: ClassVar[type[Schema]] = Schema
 
