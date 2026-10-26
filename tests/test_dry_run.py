@@ -4,6 +4,7 @@
 """Tests for dry-run config details display (mounts, env vars)."""
 
 import os
+import re
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -78,6 +79,21 @@ def test_cluster_gpu_visibility_is_visible(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("SRTSLURM_CONFIG", str(cluster_config))
     show_config_details(_make_config())
     assert "GPU subset visibility variable: ROCR_VISIBLE_DEVICES" in capsys.readouterr().out
+
+
+# "release ... post-process" on one logical line, or the srtslurm.yaml key itself.
+_NODE_RELEASE_LINE = re.compile(r"releas\w*[^\n]{0,160}post-?process|release_nodes_before_postprocess")
+
+
+@pytest.mark.parametrize(("release", "shown"), [(True, True), (False, False), (None, False)])
+def test_node_release_before_postprocess_is_visible_only_when_on(tmp_path, monkeypatch, capsys, release, shown):
+    cluster = {} if release is None else {"release_nodes_before_postprocess": release}
+    cluster_config = tmp_path / "srtslurm.yaml"
+    cluster_config.write_text(yaml.safe_dump(cluster))
+    monkeypatch.setenv("SRTSLURM_CONFIG", str(cluster_config))
+    show_config_details(_make_config())
+    output = capsys.readouterr().out.lower()
+    assert bool(_NODE_RELEASE_LINE.search(output)) is shown, output
 
 
 def test_pinned_hf_snapshot_is_visible_and_validated(capsys):

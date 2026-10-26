@@ -974,7 +974,7 @@ class SweepOrchestrator(
             # Post-process first: generate rollup, upload logs to S3, eagerly
             # push logs_url to the status API. Runs before report_completed so
             # the final PUT can reassert the artifact pointer.
-            self.run_postprocess(exit_code, reporter=reporter)
+            self.run_postprocess(exit_code, reporter=reporter, received_signal=registry.received_signal)
             if log_streamer is not None:
                 log_streamer.stop()
             reporter.report_completed(

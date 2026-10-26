@@ -5,7 +5,8 @@
 SLURM utilities for job management and process launching.
 
 This module consolidates all SLURM-related functionality:
-- Environment: get_slurm_job_id, get_slurm_nodelist
+- Environment: get_slurm_job_id, get_slurm_nodelist, get_batch_host
+- Allocation: shrink_job_allocation
 - Network: get_hostname_ip, get_node_ips
 - Process launching: start_srun_process, run_command
 - Container utilities: get_container_mounts_str
@@ -14,16 +15,19 @@ This module consolidates all SLURM-related functionality:
 import hashlib
 import logging
 import os
+import re
 import shlex
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 from _thread import LockType
 from collections.abc import Sequence
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 from .ip_utils import get_node_ip
 
@@ -79,6 +83,20 @@ def _expand_nodelist(nodelist_raw: str) -> list[str]:
         return [nodelist_raw]
 
 
+def get_batch_host() -> str | None:
+    """Node running the batch script: ``SLURMD_NODENAME``, else the first allocated node.
+
+    Slurm runs the batch script on the first node of a non-het allocation, so
+    the fallback agrees with ``SLURMD_NODENAME`` whenever both are available.
+    Returns None outside a Slurm job.
+    """
+    node = os.environ.get("SLURMD_NODENAME")
+    if node:
+        return node
+    nodelist = get_slurm_nodelist()
+    return nodelist[0] if nodelist and nodelist[0] else None
+
+
 def get_slurm_het_nodelists() -> list[list[str]] | None:
     """Per-component nodelists for a SLURM heterogeneous job, else None.
 
@@ -101,6 +119,246 @@ def get_slurm_het_nodelists() -> list[list[str]] | None:
         nodelist_raw = os.environ.get(f"SLURM_JOB_NODELIST_HET_GROUP_{i}", "")
         groups.append(_expand_nodelist(nodelist_raw))
     return groups
+
+
+# ============================================================================
+# Allocation Shrink
+# ============================================================================
+
+# Variables Slurm's resize script sets to the new size, each only when it was already set.
+_RESIZE_NODELIST_VARS = ("SLURM_NODELIST", "SLURM_JOB_NODELIST")
+_RESIZE_NODE_COUNT_VARS = ("SLURM_NNODES", "SLURM_JOB_NUM_NODES")
+# Unset when SLURM_TASKS_PER_NODE is set: scontrol cannot recompute them for the new size.
+_RESIZE_UNSET_VARS = ("SLURM_NPROCS", "SLURM_NTASKS", "SLURM_TASKS_PER_NODE")
+# Every name scontrol's resize script may set or unset (src/scontrol/update_job.c _update_job_size);
+# any other name in the file is ignored.
+_RESIZE_SCRIPT_VARS = frozenset(
+    (*_RESIZE_NODELIST_VARS, *_RESIZE_NODE_COUNT_VARS, "SLURM_JOB_CPUS_PER_NODE", *_RESIZE_UNSET_VARS)
+)
+_RESIZE_EXPORT_RE = re.compile(r'^export\s+([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"]*)"|(\S*))\s*$')
+_RESIZE_UNSET_RE = re.compile(r"^unset\s+([A-Za-z_][A-Za-z0-9_]*)\s*$")
+# One group of SLURM_JOB_CPUS_PER_NODE: "64" or "64(x3)".
+_CPU_GROUP_RE = re.compile(r"^(\d+)(?:\(x(\d+)\))?$")
+
+
+@dataclass(frozen=True)
+class AllocationShrink:
+    """Outcome of ``shrink_job_allocation``.
+
+    Attributes:
+        requested: ``scontrol update`` was invoked (False when the shrink was skipped).
+        succeeded: scontrol accepted the new node list.
+        retained: The node the job was asked to keep.
+        released: Nodes given back to the scheduler; empty unless ``succeeded``.
+        verified: ``squeue`` reported exactly ``retained`` after the update.
+        reason: Skip reason, scontrol error, or verification warning; None on a clean verified success.
+        duration_s: Wall time spent in ``shrink_job_allocation``.
+    """
+
+    requested: bool
+    succeeded: bool
+    retained: str
+    released: tuple[str, ...]
+    verified: bool
+    reason: str | None
+    duration_s: float
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-serialisable form, ``released`` as a list."""
+        data = asdict(self)
+        data["released"] = list(self.released)
+        return data
+
+
+def _parse_resize_script(path: Path) -> list[tuple[str, str | None]] | None:
+    """Parse scontrol's ``slurm_job_<id>_resize.sh`` into (name, value) pairs; value None means unset.
+
+    The file is parsed, never executed. Recognises ``export K="V"``, ``export K=V``
+    and ``unset K`` for the variables scontrol writes (``_RESIZE_SCRIPT_VARS``) and
+    ignores every other line and name. Returns None when the file is missing,
+    unreadable, or holds no accepted line, so the caller applies the equivalent
+    update itself.
+    """
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+    ops: list[tuple[str, str | None]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if (match := _RESIZE_EXPORT_RE.match(line)) and match.group(1) in _RESIZE_SCRIPT_VARS:
+            value = match.group(2) if match.group(2) is not None else match.group(3)
+            ops.append((match.group(1), value))
+        elif (match := _RESIZE_UNSET_RE.match(line)) and match.group(1) in _RESIZE_SCRIPT_VARS:
+            ops.append((match.group(1), None))
+    return ops or None
+
+
+def _expand_cpus_per_node(compressed: str) -> list[str]:
+    """Expand Slurm's compressed per-node count, ``"72,64(x3)"`` -> ``["72", "64", "64", "64"]``."""
+    counts: list[str] = []
+    for group in compressed.split(","):
+        match = _CPU_GROUP_RE.match(group.strip())
+        if match is None:
+            raise ValueError(f"unrecognised SLURM_JOB_CPUS_PER_NODE group {group!r}")
+        counts.extend([match.group(1)] * int(match.group(2) or 1))
+    return counts
+
+
+def _kept_node_cpus(compressed: str, nodelist: Sequence[str], keep: str) -> str:
+    """The kept node's entry in ``SLURM_JOB_CPUS_PER_NODE``, which lists counts in nodelist order.
+
+    Falls back to the first group's count when the value does not expand to one
+    entry per node.
+    """
+    first = compressed.split(",")[0].split("(")[0].strip()
+    try:
+        counts = _expand_cpus_per_node(compressed)
+    except ValueError:
+        return first
+    if len(counts) != len(nodelist) or keep not in nodelist:
+        return first
+    return counts[list(nodelist).index(keep)]
+
+
+def _fallback_resize_ops(keep: str, nodelist: Sequence[str]) -> list[tuple[str, str | None]]:
+    """The update Slurm's resize script makes for a one-node allocation, computed from ``os.environ``.
+
+    ``nodelist`` is the allocation before the shrink, used to find the kept node's CPU count.
+    """
+    ops: list[tuple[str, str | None]] = []
+    for name in _RESIZE_NODELIST_VARS:
+        if name in os.environ:
+            ops.append((name, keep))
+    for name in _RESIZE_NODE_COUNT_VARS:
+        if name in os.environ:
+            ops.append((name, "1"))
+    cpus = os.environ.get("SLURM_JOB_CPUS_PER_NODE")
+    if cpus is not None:
+        ops.append(("SLURM_JOB_CPUS_PER_NODE", _kept_node_cpus(cpus, nodelist, keep)))
+    if "SLURM_TASKS_PER_NODE" in os.environ:
+        ops.extend((name, None) for name in _RESIZE_UNSET_VARS)
+    return ops
+
+
+def _apply_resize(script: Path, keep: str, nodelist: Sequence[str]) -> None:
+    """Apply scontrol's resize script to ``os.environ``, or the equivalent fallback when it is absent.
+
+    scontrol exits 0 even when it could not write the script, and writes none
+    without ``SLURM_JOBID`` in its environment, so a missing file is expected.
+    """
+    ops = _parse_resize_script(script)
+    for name, value in ops if ops is not None else _fallback_resize_ops(keep, nodelist):
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
+def _squeue_nodelist(job_id: str, timeout: float) -> list[str] | None:
+    """The job's current nodes from ``squeue -h -j <id> -o %N``, or None when squeue fails."""
+    try:
+        result = subprocess.run(
+            ["squeue", "-h", "-j", job_id, "-o", "%N"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        raw = (result.stdout or "").strip()
+        return _expand_nodelist(raw) if raw else None
+    except Exception:  # noqa: BLE001 - verification is advisory
+        return None
+
+
+def shrink_job_allocation(job_id: str, keep: str, *, timeout: float = 30.0) -> AllocationShrink:
+    """Shrink a running job to the single node ``keep``, returning the other nodes to the scheduler.
+
+    Runs ``scontrol update JobId=<id> NodeList=<keep>`` from a scratch directory
+    (scontrol writes ``slurm_job_<id>_resize.{sh,csh}`` into its working
+    directory), checks the result with ``squeue``, then applies that resize
+    script to ``os.environ`` so every later srun inherits the new node list and
+    counts. Slurm refuses the update under ``SchedulerParameters=disable_job_shrink``,
+    when ``keep`` is not the batch host, or for arbitrary task distribution; the
+    environment is then left untouched. Never raises.
+
+    ``squeue`` decides when it answers: exactly ``[keep]`` is a verified release
+    and any other node list is a failure, because slurmctld accepts an update to
+    the job's submitted ``--nodelist`` as a no-op (job_mgr.c:13314-13317). When
+    squeue cannot answer, scontrol's exit 0 stands as an unverified release.
+    After a scontrol timeout only an exact ``[keep]`` counts, since slurmctld may
+    have applied the shrink before the client gave up.
+    """
+    start = time.monotonic()
+    requested = False
+
+    def result(
+        *,
+        succeeded: bool = False,
+        released: tuple[str, ...] = (),
+        verified: bool = False,
+        reason: str | None,
+    ) -> AllocationShrink:
+        return AllocationShrink(
+            requested=requested,
+            succeeded=succeeded,
+            retained=keep,
+            released=released,
+            verified=verified,
+            reason=reason,
+            duration_s=time.monotonic() - start,
+        )
+
+    try:
+        current = get_slurm_nodelist()
+        if keep not in current:
+            return result(reason=f"{keep} is not in the job's nodelist ({','.join(current) or 'empty'})")
+        if current == [keep]:
+            return result(reason=f"allocation is already only {keep}; nothing to release")
+        released = tuple(node for node in current if node != keep)
+
+        with tempfile.TemporaryDirectory(prefix="srtctl-resize-", ignore_cleanup_errors=True) as scratch:
+            resize_script = Path(scratch) / f"slurm_job_{job_id}_resize.sh"
+            requested = True
+            try:
+                proc = subprocess.run(
+                    ["scontrol", "update", f"JobId={job_id}", f"NodeList={keep}"],
+                    cwd=scratch,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                if _squeue_nodelist(job_id, timeout) != [keep]:
+                    return result(reason=f"scontrol update timed out after {timeout:g}s")
+                _apply_resize(resize_script, keep, current)
+                return result(
+                    succeeded=True,
+                    released=released,
+                    verified=True,
+                    reason=f"scontrol update timed out after {timeout:g}s, but squeue shows the job on {keep} only",
+                )
+            except OSError as e:
+                return result(reason=f"scontrol update failed to run: {e}")
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "").strip() or "no output"
+                return result(reason=f"scontrol update exited {proc.returncode}: {detail}")
+
+            nodes_after = _squeue_nodelist(job_id, timeout)
+            if nodes_after is not None and nodes_after != [keep]:
+                return result(
+                    reason=f"scontrol update exited 0 but squeue still shows {','.join(nodes_after)}, expected {keep}"
+                )
+            _apply_resize(resize_script, keep, current)
+    except Exception as e:  # noqa: BLE001 - the caller is a cleanup path
+        return result(reason=f"shrink failed: {e}")
+
+    if nodes_after is None:
+        return result(succeeded=True, released=released, reason="squeue could not confirm the new nodelist")
+    return result(succeeded=True, released=released, verified=True, reason=None)
 
 
 # ============================================================================

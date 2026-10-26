@@ -72,6 +72,13 @@ default_time_limit: "04:00:00"
 #   ignore_failure: false
 #   timeout_seconds: 300
 
+# Give idle nodes back to the scheduler before post-processing. After every
+# worker stops, the job shrinks to its batch host (`scontrol update
+# NodeList=<batch host>`) and the S3 upload / AI analysis run there. Needs job
+# shrinking allowed (no SchedulerParameters=disable_job_shrink); het jobs are
+# skipped. The outcome is written to <log_dir>/allocation-release.json.
+# release_nodes_before_postprocess: true   # Default: false
+
 # SLURM directive compatibility
 # Set to false if your cluster doesn't support --gpus-per-node
 use_gpus_per_node_directive: true  # Default: true

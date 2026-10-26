@@ -431,6 +431,8 @@ class RuntimeContext:
     request_plane: str = "tcp"
     # Full Dynamo configuration for native sidecar launch settings.
     dynamo: "DynamoConfig | None" = None
+    # srtslurm.yaml release_nodes_before_postprocess: shrink the job to the batch host before post-processing.
+    release_nodes_before_postprocess: bool = False
 
     @property
     def container_log_dir(self) -> Path:
@@ -591,6 +593,7 @@ class RuntimeContext:
         container_prepare_timeout_seconds = float(
             config.health_check.max_attempts * config.health_check.interval_seconds
         )
+        release_nodes_before_postprocess = bool(get_srtslurm_setting("release_nodes_before_postprocess", False))
         temp_context = cls(
             job_id=job_id,
             run_name=run_name,
@@ -614,6 +617,7 @@ class RuntimeContext:
             container_model_path=container_model_path,
             request_plane=config.dynamo.request_plane,
             dynamo=config.dynamo,
+            release_nodes_before_postprocess=release_nodes_before_postprocess,
         )
 
         # Expand FormattablePath mounts
@@ -647,6 +651,7 @@ class RuntimeContext:
             container_model_path=container_model_path,
             request_plane=config.dynamo.request_plane,
             dynamo=config.dynamo,
+            release_nodes_before_postprocess=release_nodes_before_postprocess,
         )
 
     @property
