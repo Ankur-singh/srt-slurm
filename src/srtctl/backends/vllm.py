@@ -790,6 +790,22 @@ class VLLMBackend(Backend):
             for key, value in self.get_config_for_mode(mode).items()
         )
 
+    def owns_dp_ranks(self, process: Process) -> bool:
+        """Whether a worker process runs data-parallel ranks of its own and exports their metrics.
+
+        Each per-GPU rank, and each per-node process whose node holds whole TP x PP replicas
+        (``--data-parallel-hybrid-lb``), is its own engine-core client: it serves the requests
+        routed to its ranks and records their ``vllm:*`` series, including the speculative
+        decoding counters, on its own ``/metrics``. A node of a replica that spans nodes runs
+        headless and reports through the replica's leader.
+        """
+        mode = process.endpoint_mode
+        if not self.is_dp_mode(mode):
+            return False
+        if self.dp_launch_mode == "per_gpu":
+            return True
+        return self._get_tp_size(mode) * self._get_pp_size(mode) <= len(process.gpu_indices)
+
     def _get_dp_size(self, mode: WorkerMode) -> int | None:
         """Get the data-parallel-size for a mode, or None if not in DP mode."""
         config = self.get_config_for_mode(mode)

@@ -394,6 +394,7 @@ class TestCustomBenchmarkRunner:
         dynamo_sidecar=False,
         trtllm_config=None,
         engine_args=None,
+        dp_launch_mode="per_node",
     ):
         from types import SimpleNamespace
 
@@ -428,6 +429,14 @@ class TestCustomBenchmarkRunner:
                     for role, mode in (("prefill", "prefill"), ("decode", "decode"), ("agg", "aggregated"))
                     if role in mode_environments or mode in engine_sections
                 },
+            )
+        elif engine_args is not None and backend_type == "vllm":
+            from srtctl.backends import VLLMBackend
+            from srtctl.core.schema import RoleConfig
+
+            backend = VLLMBackend(
+                dp_launch_mode=dp_launch_mode,
+                roles={role: RoleConfig(args=args) for role, args in engine_args.items()},
             )
         elif engine_args is not None:
             from srtctl.backends import SGLangBackend
@@ -561,6 +570,34 @@ class TestCustomBenchmarkRunner:
 
     def test_sglang_pure_tp_custom_metrics_keep_logical_leaders(self):
         env = self._custom_env({"prefill": {"tp-size": 8}, "decode": {"tp-size": 8}})
+
+        assert env["AIPERF_SERVER_METRICS_URLS"] == "http://ip-node-p0:7500/metrics,http://ip-node-d0:7504/metrics"
+
+    @pytest.mark.parametrize("dp_launch_mode", ["per_node", "per_gpu"])
+    def test_vllm_data_parallel_custom_metrics_scrape_followers_in_topology_order(self, dp_launch_mode):
+        # DEP8 on two 4-GPU nodes (TP1 x DP8): each node's worker serves and counts DP ranks 0-3 or 4-7.
+        dep8 = {"tensor-parallel-size": 1, "data-parallel-size": 8}
+        env = self._custom_env({"prefill": dep8, "decode": dep8}, backend_type="vllm", dp_launch_mode=dp_launch_mode)
+
+        # Routing still targets logical leaders; only metrics include follower ranks.
+        assert env["SRT_PREFILL_ENDPOINTS"] == "ip-node-p0:7500"
+        assert env["SRT_DECODE_ENDPOINTS"] == "ip-node-d0:7504"
+        assert env["AIPERF_SERVER_METRICS_URLS"] == (
+            "http://ip-node-p0:7500/metrics,http://ip-node-p1:7501/metrics,"
+            "http://ip-node-d0:7504/metrics,http://ip-node-d1:7505/metrics"
+        )
+
+    @pytest.mark.parametrize(
+        "decode",
+        [
+            # A TP8 replica spans both 4-GPU nodes: the follower node runs headless.
+            {"tensor-parallel-size": 8, "data-parallel-size": 2},
+            {"tensor-parallel-size": 8},
+        ],
+        ids=["cross-node-replica", "pure-tp"],
+    )
+    def test_vllm_custom_metrics_keep_the_leader_of_a_cross_node_replica(self, decode):
+        env = self._custom_env({"prefill": {"tensor-parallel-size": 8}, "decode": decode}, backend_type="vllm")
 
         assert env["AIPERF_SERVER_METRICS_URLS"] == "http://ip-node-p0:7500/metrics,http://ip-node-d0:7504/metrics"
 
