@@ -17,9 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from srtctl.backends.base import WorkerMode
-from srtctl.backends.sglang import SGLangBackend
 from srtctl.backends.trtllm import TRTLLMBackend
-from srtctl.backends.vllm import VLLMBackend
 from srtctl.core.fingerprint import format_identity_verification, verify_identity
 from srtctl.core.health import wait_for_model
 from srtctl.core.ip_utils import url_host
@@ -733,9 +731,10 @@ class BenchmarkStageMixin:
 
         Built-in AIPerf runners retain their existing physical-process metrics
         behavior, which is required by vLLM data-parallel layouts. Custom
-        benchmarks use logical worker leaders so distributed SGLang follower
-        ranks are not advertised as separate engines, except the followers of a
-        role that owns attention-DP ranks (see ``_process_owns_dp_ranks``).
+        benchmarks use logical worker leaders so distributed follower ranks are
+        not advertised as separate engines, except followers that run
+        data-parallel ranks of their own: SGLang attention-DP ranks and vLLM
+        per-GPU or node-local DP groups (see ``_process_owns_dp_ranks``).
         In a Dynamo sidecar job, built-in runners get exactly what Tachometer
         scrapes (``sidecar_worker_metrics_targets``): each sidecar's runtime
         endpoint and each native engine's own Prometheus endpoint. Custom
@@ -859,13 +858,10 @@ class BenchmarkStageMixin:
         distinct DP ranks and exports their cache and load metrics. With vLLM
         data parallelism, every per-GPU rank and every node-local DP group serves
         the requests routed to its ranks and exports their request, token and
-        speculative-decoding counters (``VLLMBackend.owns_dp_ranks``). Scraping
-        only the leader drops them.
+        speculative-decoding counters. Scraping only the leader drops them. The
+        backend decides (``Backend.owns_dp_ranks``).
         """
-        backend = self.config.backend
-        if isinstance(backend, SGLangBackend):
-            return backend.num_dp_ranks(process.endpoint_mode) > 1
-        return isinstance(backend, VLLMBackend) and backend.owns_dp_ranks(process)
+        return self.config.backend.owns_dp_ranks(process)
 
     def _get_benchmark_env(self, runner: "BenchmarkRunner") -> dict[str, str]:
         """Get environment variables for the benchmark script."""
